@@ -1,5 +1,10 @@
 # Change Log
 
+## [1.0.4] (ethansk fork) — open changes at your position + Ctrl+Shift+G
+
+- **New `better-git-vscode.open-change-at-position` command** — the mirror image of the reveal command. From a plain file editor it opens that file's side-by-side **changes (diff)** view scrolled to the **exact cursor + scroll position you were just viewing**, instead of `git.openChange`'s default of jumping to the file's first change. (It captures your cursor/top-line *before* opening the diff, then re-applies them to the diff's right side, clamped to the diff's length — same clamping the reveal command uses, since a partially-staged file's content can differ.)
+- **`Ctrl+Shift+G` now opens the current file's changes at your position AND the Source Control pane.** It's a composite default binding (built on VS Code's `runCommands`) that runs `better-git-vscode.open-change-at-position` then `workbench.view.scm`. This shadows VS Code's stock "show Source Control" chord (which only did the latter). Bound to `Ctrl+Shift+G` on every platform (not `Cmd` on mac, since `Cmd+Shift+G` is taken there). **Fully overridable** in your own `keybindings.json` like any other default.
+
 ## [1.0.3] (ethansk fork) — Dvorak mode toggle
 
 - **New `better-git-vscode.dvorakMode` setting (boolean, default false).** Flip it on and the four navigation commands swap from their QWERTY positions to Dvorak-comfortable physical keys — no hand-editing `keybindings.json` required:

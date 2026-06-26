@@ -2,7 +2,7 @@
   "name": "better-git-vscode",
   "displayName": "Better Git VS Code",
   "description": "Fast keyboard-driven git diff review \u2014 jump between changes and changed files, stage-and-advance, revert, all without the mouse.",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "icon": "src/icon.png",
   "engines": {
     "vscode": "^1.83.0"
@@ -79,6 +79,10 @@
       {
         "command": "better-git-vscode.reveal-current-file-in-explorer",
         "title": "Open & reveal current file in Explorer (works from staged diffs)"
+      },
+      {
+        "command": "better-git-vscode.open-change-at-position",
+        "title": "Open changes (diff) at current cursor/scroll position"
       }
     ],
     "menus": {
@@ -150,6 +154,21 @@
       "alt+q revert, alt+r reveal) is LEFT ON ITS DEFAULT regardless of dvorakMode — Ethan's manual block",
       "never remapped those (his F13/F17/F18/F19 Karabiner mouse-button bindings drive smart-back/forward",
       "+ stage), so dvorakMode must not touch them."
+    ],
+    "_comment_ctrlShiftG_keybinding": [
+      "ctrl+shift+g (the LAST entry in `keybindings` below) is a COMPOSITE binding built on VS Code's",
+      "built-in `runCommands` command. `runCommands` runs each id in `args.commands` in order, and it IS",
+      "supported directly inside contributes.keybindings (the manifest keybindings go through the SAME",
+      "resolver as a user keybindings.json, so the args-bearing form works identically here — no extension",
+      "code needed). We use it so one chord does two things in sequence:",
+      "  1. better-git-vscode.open-change-at-position — open the active file's side-by-side diff scrolled to",
+      "     the EXACT cursor + top line you were viewing in the plain file (our new mirror-of-reveal command).",
+      "  2. workbench.view.scm — then focus/open the Source Control pane so the file is highlighted there.",
+      "WHY ctrl+shift+g: it shadows VS Code's default 'show Source Control' chord, which only did step 2 —",
+      "this upgrades it to 'jump into this file's changes at my position AND show Source Control'. We bind the",
+      "SAME key on mac + win/linux (ctrl, not cmd) on purpose: cmd+shift+g is taken on mac (find-next-match),",
+      "so ctrl+shift+g is the cross-platform-consistent choice. Users can override/disable it in their own",
+      "keybindings.json exactly like every other default (a `-runCommands` minus-entry on ctrl+shift+g)."
     ],
     "keybindings": [
       {
@@ -229,6 +248,12 @@
         "command": "better-git-vscode.reveal-current-file-in-explorer",
         "key": "alt+r",
         "mac": "alt+r"
+      },
+      {
+        "command": "runCommands",
+        "key": "ctrl+shift+g",
+        "mac": "ctrl+shift+g",
+        "args": { "commands": ["better-git-vscode.open-change-at-position", "workbench.view.scm"] }
       }
     ]
   },

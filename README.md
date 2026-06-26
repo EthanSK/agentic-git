@@ -51,10 +51,16 @@ All bindings ship as defaults and are fully overridable (see below).
 | Stage current file + previous change | `Shift+Alt+,` | `Shift+Alt+,` |
 | Revert selected change and save | `Alt+Q` | `Alt+Q` |
 | Reveal current file in Explorer | `Alt+R` | `Alt+R` |
+| Open changes at cursor/scroll + Source Control | `Ctrl+Shift+G` | `Ctrl+Shift+G` |
 
 > **Smart forward / back** means: if you're in a diff, move to the next/previous change
 > within it; otherwise navigate forward/back through changed files. It's the one binding
 > you need for most reviews.
+
+> **`Ctrl+Shift+G`** is remapped from VS Code's stock "show Source Control" chord (which only
+> opened the panel) to *also* open the current file's changes (diff) at the exact cursor and
+> scroll position you were viewing first, then show Source Control. Override it like any other
+> binding if you want the original behaviour back.
 
 `Stage current file` is also available as a `+` button in the editor title bar (no key
 needed).

@@ -119,6 +119,63 @@ export function activate(context: vscode.ExtensionContext) {
         }
     });
 
+    // MIRROR IMAGE of disposable11: that command goes diff -> working file at the same spot; THIS one goes
+    // working file -> diff at the same spot. You're editing a file in a normal editor, hit this, and the
+    // side-by-side "changes" view opens scrolled to the EXACT cursor + top line you were just looking at
+    // (instead of git.openChange's default of jumping to the first change in the file). Bind it yourself in
+    // keybindings.json — we intentionally ship NO default key for this one.
+    let disposable12 = vscode.commands.registerCommand("better-git-vscode.open-change-at-position", async () => {
+        // CAPTURE BEFORE OPENING THE DIFF. This is critical: git.openChange swaps the active editor to the
+        // diff and typically moves the cursor to the file's first change — so if we read selection/scroll
+        // AFTER the call we'd get the diff's position, not the working-file position we actually want to mirror.
+        const src = vscode.window.activeTextEditor;
+        if (!src) {
+            return; // no active editor -> nothing to mirror, bail
+        }
+        const cursor = src.selection.active; // the cursor we want to reapply on the diff's right side
+        const topLine = src.visibleRanges?.length ? src.visibleRanges[0].start.line : undefined; // top visible line (scroll)
+
+        // Open the built-in "Open Changes" side-by-side diff for the active file (same as the SCM gutter/title
+        // "Open Changes" action). This is what changes the active editor out from under us — hence the capture above.
+        await vscode.commands.executeCommand("git.openChange");
+
+        // DETECT THE DIFF + TIMING. We CANNOT detect the switch by uri: after git.openChange the diff's
+        // MODIFIED (right) side is the SAME working file, so vscode.window.activeTextEditor.document.uri is
+        // unchanged from before — a uri compare would always say "no switch happened". Instead we detect the
+        // diff by the active TAB's input type: vscode.TabInputTextDiff means a side-by-side text diff tab is
+        // active (the same focus-independent check the smart-mouse + badge code uses elsewhere in this file).
+        // The switch is NOT guaranteed synchronous (git.openChange resolves the diff content asynchronously),
+        // so we POLL: up to ~600ms in ~50ms steps, waiting until BOTH the active tab is a TabInputTextDiff AND
+        // there's an activeTextEditor to apply the position to. If it never becomes a diff within the timeout
+        // (e.g. an untracked/new file opens as a plain editor via vscode.open, not vscode.diff), we just fall
+        // through and apply to whatever the active editor is — best-effort, never a no-op.
+        const deadline = Date.now() + 600; // ~600ms total budget
+        while (Date.now() < deadline) {
+            const isDiff = vscode.window.tabGroups.activeTabGroup.activeTab?.input instanceof vscode.TabInputTextDiff;
+            if (isDiff && vscode.window.activeTextEditor) {
+                break; // diff is up and we have an editor to position — stop polling
+            }
+            await new Promise((r) => setTimeout(r, 50)); // wait one ~50ms tick before re-checking
+        }
+
+        // Apply the captured position to the diff's right side (the now-active editor). SAME clamping logic as
+        // disposable11: a file's diff side can differ in length from what we captured, so clamp the line to the
+        // document's last line and the character to that line's length to avoid an out-of-range Position throw.
+        const editor = vscode.window.activeTextEditor;
+        if (!editor) {
+            return; // diff never produced an editor (e.g. binary) -> nothing to position, bail
+        }
+        const lastLine = Math.max(0, editor.document.lineCount - 1);
+        const line = Math.min(cursor.line, lastLine);
+        const ch = Math.min(cursor.character, editor.document.lineAt(line).text.length);
+        const pos = new vscode.Position(line, ch);
+        editor.selection = new vscode.Selection(pos, pos);
+        if (topLine !== undefined) {
+            const top = Math.min(topLine, lastLine);
+            editor.revealRange(new vscode.Range(top, 0, top, 0), vscode.TextEditorRevealType.AtTop); // match scroll: same top line
+        }
+    });
+
     // OVERLAY (supported API, no patching): badge the file currently open as a diff with a "▶" marker via a
     // FileDecorationProvider. The badge renders on the row in the built-in Source Control panel (and the
     // Explorer/tabs), giving a "you are here" indicator on the real Git rows. Caveat: decorations key on the
@@ -173,7 +230,7 @@ export function activate(context: vscode.ExtensionContext) {
 
     context.subscriptions.push(
         disposable, disposable2, disposable3, disposable4, disposable5, disposable6, disposable7, disposable8,
-        disposable9, disposable10, disposable11,
+        disposable9, disposable10, disposable11, disposable12,
         reviewDecoEmitter,
         vscode.window.registerFileDecorationProvider(reviewDecorationProvider),
         vscode.window.tabGroups.onDidChangeTabs(() => refreshReviewDecoration()),
