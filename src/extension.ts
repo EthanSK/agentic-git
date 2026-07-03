@@ -599,7 +599,13 @@ const getFileChanges = async (): Promise<FileChange[]> => {
     const gitExtension = vscode.extensions.getExtension<any>("vscode.git")!.exports;
     const git = gitExtension.getAPI(1);
     const workspaceUri = vscode.workspace.workspaceFolders?.map((ws) => ws.uri)[0];
-    const activeRepo = git.getRepository(workspaceUri?.path) || git.repositories[0];
+    // Prefer the repo that owns the file CURRENTLY BEING REVIEWED (tab-derived, focus-independent) so a
+    // multi-root workspace navigates within the right repo — falling through from a file in repo B used to
+    // build repo A's list, miss the file (findCurrentIndex -1) and silently stop (Codex review, v1.2.1).
+    // Fall back to the first workspace folder's repo / first known repo, as before.
+    const reviewUri = currentReviewFileUri();
+    const activeRepo =
+        (reviewUri && git.getRepository(reviewUri)) || git.getRepository(workspaceUri?.path) || git.repositories[0];
     const isTreeView = vscode.workspace.getConfiguration("better-git-vscode").get("treeView");
 
     // Keep the git status alongside the uri for staged entries: openChangeEntry needs it to choose which
@@ -750,12 +756,31 @@ const getEmptyTreeRef = async (uri: vscode.Uri): Promise<string | undefined> => 
 const openChangeEntry = async (entry: FileChange): Promise<void> => {
     if (!entry.staged) {
         // Working-tree (unstaged) diff — git.openChange opens this side correctly, including untracked/new
-        // files (it shows them as a diff against an empty original, the same as clicking the row). Defensive
-        // fallback: if a diff genuinely can't be produced, open the file itself so the command never no-ops.
+        // files (it shows them as a plain editor, the same as clicking the row). Defensive fallback: if a
+        // view genuinely can't be produced, open the file itself so the command never no-ops.
         try {
             await vscode.commands.executeCommand("git.openChange", entry.uri);
         } catch {
             await vscode.window.showTextDocument(entry.uri, { preview: true });
+        }
+        // SILENT-NO-OP GUARD (Codex review, v1.2.1): with git.untrackedChanges="separate", untracked files
+        // live in the separate untracked group and git.openChange(uri) resolves nothing for them — and it
+        // does NOT throw, so the catch above never fires and navigation would just... stay put. Verify the
+        // active tab actually shows the requested file now; if not, open it directly. (uriFilePathOfTab
+        // logic: reuse currentReviewFileUri-style tab reading via activeTab input.)
+        const shownInput: unknown = vscode.window.tabGroups.activeTabGroup.activeTab?.input;
+        const shownUri =
+            shownInput instanceof vscode.TabInputTextDiff
+                ? toFilePathUri(shownInput.modified) ?? toFilePathUri(shownInput.original)
+                : shownInput instanceof vscode.TabInputText
+                    ? toFilePathUri(shownInput.uri)
+                    : undefined;
+        if (!shownUri || shownUri.path.toLowerCase() !== entry.uri.path.toLowerCase()) {
+            try {
+                await vscode.window.showTextDocument(entry.uri, { preview: true });
+            } catch {
+                // file unreadable (e.g. binary/permission edge) — nothing more we can do, but we tried both paths
+            }
         }
         return;
     }

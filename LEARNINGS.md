@@ -24,6 +24,16 @@ Each entry looks like:
 (newest first)
 
 ---
+**Date:** 2026-07-03T00:46:34Z
+**Trigger:** Ethan voice 2026-07-03 'glitchy as fuck... worked once and now it's just not going to next change' + follow-ups (5-line jump on modified files, deleted file does nothing)
+**Symptom:** v1.2.0 'scroll through newly-added files' glitchy: next-scm-change stopped advancing (perceived no-op), 5-line jump wrongly fired on MODIFIED files, deleted files dead-ended navigation
+**Root cause:** Decision/action editor mismatch: goToNextDiff decided 'new file?' from the ACTIVE TAB (currentReviewFileUri) but stepped vscode.window.activeTextEditor — the FOCUSED editor, which is a different concept. SCM single-clicks open files with preserveFocus:true, so activeTextEditor stays pointing at a stale/different file: steps landed invisibly in hidden editors (no-op) or in a modified file's editor (hunk-nav hijack). Compounders: isFullyAddedFile returned true for dual-state INDEX_ADDED+MODIFIED files and consulted repositories[0] as fallback; unfocused editors render no caret so even correct steps were invisible; getActiveChange resolved plain tabs from activeTextEditor so deleted-file (git: scheme plain tab) navigation dead-ended on stale paths
+**Fix:** v1.2.1: structural gate newFileScrollEditor() — 5-line step ONLY when active tab is TabInputText (plain editor, so diffs/modified files can NEVER step) AND uri scheme is file: (excludes deleted files' git: HEAD view) AND hardened isFullyAddedFile (dual-state veto, no repo guessing, UNTRACKED/INDEX_ADDED/INTENT_TO_ADD only) AND a visible editor for that exact document exists — stepping acts on THAT editor, focused, reveal InCenter. Hunk nav reads lineBefore/After from tab-derived editor. getActiveChange resolves plain tabs tab-first. Plus real E2E suite (npm test) pinning every file state
+**Commit:** pending-on-branch-fix/new-file-nav-glitch-e2e
+**Guard:** E2E suite src/test/suite/navigation.test.ts: modified-file hunk-nav regression test (asserts cursor lands on hunk lines, not +5), deleted/renamed/staged-deleted exclusion tests, dual-state test, untracked stepping+edge tests
+---
+
+---
 **Date:** 2026-07-03T00:02:34Z
 **Trigger:** Ethan voice 2026-07-03 'jump five lines so I can scroll down the file just for newly added ones'
 **Symptom:** Reviewing a newly-added file, next/previous-change (go-to-next-change) skips straight past it — can't scroll through / read the whole new file

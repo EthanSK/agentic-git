@@ -44,9 +44,11 @@ const poll = async <T>(fn: () => T | undefined | null | false, what: string, tim
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-// The git "empty tree" id — same constant the extension uses to build the empty side of a
-// staged-new / staged-deleted diff (see openChangeEntry in src/extension.ts).
-const EMPTY_TREE = '4b825dc642cb6eb9a060e54bf8d69288fbee4904';
+// The git "empty tree" id — used to build the empty side of a staged-new / staged-deleted diff exactly
+// like the extension's openChangeEntry does. Computed from the fixture repo in suiteSetup (NOT hardcoded
+// to the SHA-1 constant) so the suite also works if the repo was initialised with the SHA-256 object
+// format (Codex review finding).
+let EMPTY_TREE = '4b825dc642cb6eb9a060e54bf8d69288fbee4904'; // SHA-1 default, overwritten in suiteSetup
 
 // Replicates the extension's toGitUri so tests can open the exact staged diffs openChangeEntry builds.
 const toGitUri = (uri: vscode.Uri, ref: string): vscode.Uri =>
@@ -160,6 +162,8 @@ suite('SCM change navigation E2E', () => {
 		const api = gitExt.exports.getAPI(1);
 		repo = await poll(() => api.repositories[0], 'vscode.git to discover the fixture repository', 60_000);
 		baseSha = git('rev-parse HEAD');
+		// Ask git itself for the empty-tree id of THIS repo's object format (SHA-1 vs SHA-256).
+		EMPTY_TREE = git('hash-object -t tree /dev/null');
 
 		// Make sure OUR extension is active before the first executeCommand (onStartupFinished usually
 		// beats us here, but don't rely on the race).
@@ -172,7 +176,12 @@ suite('SCM change navigation E2E', () => {
 		git(`reset --hard ${baseSha}`);
 		git('clean -fdq');
 		await refreshUntil(
-			() => (repo.state.workingTreeChanges ?? []).length === 0 && (repo.state.indexChanges ?? []).length === 0,
+			() =>
+				(repo.state.workingTreeChanges ?? []).length === 0 &&
+				(repo.state.indexChanges ?? []).length === 0 &&
+				// git.untrackedChanges="separate" keeps untracked files in their own list — it must drain
+				// too, or an untracked file from the previous test could leak into this one's change list.
+				(repo.state.untrackedChanges ?? []).length === 0,
 			'clean git state after reset'
 		);
 		await vscode.commands.executeCommand('workbench.action.closeAllEditors');
