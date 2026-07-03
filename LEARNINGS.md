@@ -24,6 +24,16 @@ Each entry looks like:
 (newest first)
 
 ---
+**Date:** 2026-07-03T00:02:34Z
+**Trigger:** Ethan voice 2026-07-03 'jump five lines so I can scroll down the file just for newly added ones'
+**Symptom:** Reviewing a newly-added file, next/previous-change (go-to-next-change) skips straight past it — can't scroll through / read the whole new file
+**Root cause:** goToNextDiff/goToPreviousDiff use VS Code compareEditor.next/previousChange, which treats a fully-added file (whole file is one new diff, no original side) as a single change and jumps past it to the next file
+**Fix:** Added isFullyAddedFile() (git-status detection: UNTRACKED/INDEX_ADDED/INTENT_TO_ADD via git API + toFilePathUri) + stepThroughNewFile(); goToNextDiff/goToPreviousDiff now step cursor down/up newFileNavLineJump lines (default 5) through a fully-added file, falling through to next/prev FILE at the edge. New setting better-git-vscode.newFileNavLineJump. v1.2.0
+**Commit:** 5e3ea20
+**Guard:** Behaviour gated strictly on whole-new-file git status so modified files navigate hunk-to-hunk unchanged; thorough inline comments
+---
+
+---
 **Date:** 2026-06-29T16:33:14Z
 **Trigger:** voice: show last staged file in bottom bar
 **Symptom:** Stage-and-advance (shift+alt+z) jumps to the next file instantly, so the user often stages a file without noticing and has no record of what was staged to go back and undo
