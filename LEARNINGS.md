@@ -24,6 +24,36 @@ Each entry looks like:
 (newest first)
 
 ---
+**Date:** 2026-07-04T11:58:23Z
+**Trigger:** Ethan request: 'make better-git-vscode minimize the worktrees if there are any when opening / reloading window'
+**Symptom:** Git worktrees / multiple repos render EXPANDED in the Source Control panel on every window open/reload; noisy with several worktrees
+**Root cause:** VS Code has no public API to persist/default the SCM repository/worktree section collapse state (upstream microsoft/vscode#322318). The only built-in that collapses the repo section headers is the view action workbench.scm.action.collapseAllRepositories, which no-ops unless the Source Control view is the ACTIVE sidebar (its handler resolves the target via getActiveViewWithId('workbench.scm')). Repos also populate asynchronously, so collapsing too early finds nothing to collapse.
+**Fix:** v1.2.2: collapseScmRepositories() reveals SCM via workbench.view.scm THEN runs workbench.scm.action.collapseAllRepositories (both in try/catch). runCollapseWorktreesOnStartup() polls the git API (getAPI(1).repositories.length) every 400ms up to ~10s, only collapses when >=2 repos, and briefly listens to onDidOpenRepository for ~12s to catch late worktrees. Added setting better-git-vscode.collapseWorktreesOnStartup (default true) + manual command better-git-vscode.collapse-worktrees.
+**Commit:** pending-on-branch-feat/collapse-worktrees-on-startup
+**Guard:** Command id verified against the shipped VS Code bundle (workbench.desktop.main.js: id 'workbench.scm.action.collapseAllRepositories', runInView -> collapseAllRepositories() iterating visibleRepositories). Thorough comments in extension.ts above activate() document both caveats (reveal-required view action + async populate). No unit test (needs a live VS Code host + multiple worktrees — Mini verifies).
+---
+
+---
+**Date:** 2026-07-03T00:46:34Z
+**Trigger:** Ethan voice 2026-07-03 'glitchy as fuck... worked once and now it's just not going to next change' + follow-ups (5-line jump on modified files, deleted file does nothing)
+**Symptom:** v1.2.0 'scroll through newly-added files' glitchy: next-scm-change stopped advancing (perceived no-op), 5-line jump wrongly fired on MODIFIED files, deleted files dead-ended navigation
+**Root cause:** Decision/action editor mismatch: goToNextDiff decided 'new file?' from the ACTIVE TAB (currentReviewFileUri) but stepped vscode.window.activeTextEditor — the FOCUSED editor, which is a different concept. SCM single-clicks open files with preserveFocus:true, so activeTextEditor stays pointing at a stale/different file: steps landed invisibly in hidden editors (no-op) or in a modified file's editor (hunk-nav hijack). Compounders: isFullyAddedFile returned true for dual-state INDEX_ADDED+MODIFIED files and consulted repositories[0] as fallback; unfocused editors render no caret so even correct steps were invisible; getActiveChange resolved plain tabs from activeTextEditor so deleted-file (git: scheme plain tab) navigation dead-ended on stale paths
+**Fix:** v1.2.1: structural gate newFileScrollEditor() — 5-line step ONLY when active tab is TabInputText (plain editor, so diffs/modified files can NEVER step) AND uri scheme is file: (excludes deleted files' git: HEAD view) AND hardened isFullyAddedFile (dual-state veto, no repo guessing, UNTRACKED/INDEX_ADDED/INTENT_TO_ADD only) AND a visible editor for that exact document exists — stepping acts on THAT editor, focused, reveal InCenter. Hunk nav reads lineBefore/After from tab-derived editor. getActiveChange resolves plain tabs tab-first. Plus real E2E suite (npm test) pinning every file state
+**Commit:** pending-on-branch-fix/new-file-nav-glitch-e2e
+**Guard:** E2E suite src/test/suite/navigation.test.ts: modified-file hunk-nav regression test (asserts cursor lands on hunk lines, not +5), deleted/renamed/staged-deleted exclusion tests, dual-state test, untracked stepping+edge tests
+---
+
+---
+**Date:** 2026-07-03T00:02:34Z
+**Trigger:** Ethan voice 2026-07-03 'jump five lines so I can scroll down the file just for newly added ones'
+**Symptom:** Reviewing a newly-added file, next/previous-change (go-to-next-change) skips straight past it — can't scroll through / read the whole new file
+**Root cause:** goToNextDiff/goToPreviousDiff use VS Code compareEditor.next/previousChange, which treats a fully-added file (whole file is one new diff, no original side) as a single change and jumps past it to the next file
+**Fix:** Added isFullyAddedFile() (git-status detection: UNTRACKED/INDEX_ADDED/INTENT_TO_ADD via git API + toFilePathUri) + stepThroughNewFile(); goToNextDiff/goToPreviousDiff now step cursor down/up newFileNavLineJump lines (default 5) through a fully-added file, falling through to next/prev FILE at the edge. New setting better-git-vscode.newFileNavLineJump. v1.2.0
+**Commit:** 5e3ea20
+**Guard:** Behaviour gated strictly on whole-new-file git status so modified files navigate hunk-to-hunk unchanged; thorough inline comments
+---
+
+---
 **Date:** 2026-06-29T16:33:14Z
 **Trigger:** voice: show last staged file in bottom bar
 **Symptom:** Stage-and-advance (shift+alt+z) jumps to the next file instantly, so the user often stages a file without noticing and has no record of what was staged to go back and undo

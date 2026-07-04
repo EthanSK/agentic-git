@@ -53,6 +53,142 @@ const stageThroughExtension = async (repo: any, uri: vscode.Uri): Promise<void> 
     recordLastStaged(uri); // success -> update the status bar with the file we just staged
 };
 
+// ──────────────────────────────────────────────────────────────────────────────────────────
+// COLLAPSE WORKTREES / REPOSITORY SECTIONS ON STARTUP (v1.2.2)
+//
+// WHY this exists (Ethan's exact request): he works with git WORKTREES (e.g.
+// ~/Documents/claude-worktrees/<project>-<name>). When multiple worktrees / repositories are open in
+// one window, VS Code's built-in Source Control view renders EACH repository as its own collapsible
+// section header. On every window open / reload those sections all render EXPANDED — noisy when you
+// have several worktrees. He wants them collapsed by default so the SCM panel stays tidy.
+//
+// HOW we do it — the ONLY reliable command that exists (verified against the shipped VS Code bundle,
+// src/vs/workbench/contrib/scm/):
+//   `workbench.scm.action.collapseAllRepositories`
+// Its handler literally iterates `scmViewService.visibleRepositories` and collapses every collapsible
+// one (the repo/worktree section headers) — exactly the annoyance. There is NO public extension API to
+// PERSIST or DEFAULT the SCM repository collapse state (no `scm.defaultViewMode`-style setting for repo
+// headers), so calling this command on startup is the closest available workaround. (There is also a
+// generic `workbench.scm.action.collapseAll` which collapses resource GROUPS inside a repo, not the repo
+// headers — not what we want. `git.collapseAll` does not exist.)
+//
+// CRITICAL CAVEAT #1 — the command is a VIEW ACTION: its handler resolves the target view via
+// `getActiveViewWithId("workbench.scm")`, which only returns the view when the Source Control viewlet is
+// the ACTIVE (currently-open) sidebar container. If SCM isn't the active view, the command silently
+// no-ops. So we MUST reveal SCM first (`workbench.view.scm`) and only THEN collapse. This does bring the
+// Source Control panel to the foreground — acceptable here because this whole extension is a git-diff
+// review tool and Ethan is looking at worktree changes on reload anyway; and we only auto-run it when
+// there are actually ≥2 repositories (the multi-worktree annoyance), so a single-repo window is left
+// untouched and unfocused.
+//
+// CRITICAL CAVEAT #2 — TIMING / POPULATE: the git extension discovers repositories asynchronously after
+// window load, and the SCM tree must have the repo nodes present before there's anything to collapse.
+// So the startup path POLLS the git API until repositories appear (or a timeout), then collapses; and it
+// also listens (briefly, only during a startup window) for late-appearing worktrees so those get
+// collapsed too. All best-effort and wrapped in try/catch — if the command doesn't exist on an old host,
+// or the git API isn't ready, we no-op safely and never break activation.
+
+// The built-in command id that collapses all SCM repository/worktree section headers. Kept as a const so
+// there's a single source of truth and it's easy to find/grep.
+const SCM_COLLAPSE_ALL_REPOS_COMMAND = "workbench.scm.action.collapseAllRepositories";
+
+// Reveal the Source Control view (required — see CAVEAT #1) then run the collapse-all-repositories
+// command. Returns true if the collapse command was dispatched without throwing. Fully defensive: any
+// failure (command missing on an old host, view not resolvable) is swallowed so it can never break
+// startup or a manual invocation.
+const collapseScmRepositories = async (): Promise<boolean> => {
+    try {
+        // Must make SCM the active sidebar container first, otherwise the view action can't resolve its
+        // target view and no-ops. This focuses the Source Control panel.
+        await vscode.commands.executeCommand("workbench.view.scm");
+        // Now the collapse command has a live view to act on — collapses every repo/worktree header.
+        await vscode.commands.executeCommand(SCM_COLLAPSE_ALL_REPOS_COMMAND);
+        return true;
+    } catch {
+        // Old VS Code without this command id, or the view wasn't resolvable — do nothing, safely.
+        return false;
+    }
+};
+
+// Reads the git API and returns how many repositories/worktrees VS Code currently has open (0 if the git
+// extension isn't ready yet). Used to (a) decide whether the multi-worktree annoyance even applies and
+// (b) poll until repos have populated before collapsing.
+const getOpenRepositoryCount = (): number => {
+    try {
+        const git = vscode.extensions.getExtension<any>("vscode.git")?.exports?.getAPI(1);
+        return git?.repositories?.length ?? 0;
+    } catch {
+        return 0; // git extension not present / API shape changed — treat as "no repos"
+    }
+};
+
+// The auto-on-startup routine. Gated by the `collapseWorktreesOnStartup` setting (default true) and by
+// there being ≥2 repositories (a single repo isn't the "lots of expanded worktrees" annoyance, and we
+// don't want to steal focus / hide the only repo's changes for it). Because repos populate async, we
+// POLL for them, then collapse. We ALSO briefly watch `onDidOpenRepository` so worktrees that finish
+// opening AFTER our first collapse still get folded — but only within a short startup window, so opening
+// a repo later in the session (deliberately) never yanks its section closed under the user.
+const runCollapseWorktreesOnStartup = (context: vscode.ExtensionContext): void => {
+    const enabled = vscode.workspace
+        .getConfiguration("better-git-vscode")
+        .get<boolean>("collapseWorktreesOnStartup", true);
+    if (!enabled) {
+        return; // user opted out — never auto-collapse, but the manual command still works
+    }
+
+    let done = false; // guard so we collapse at most once from the poll loop
+    const MIN_REPOS_TO_COLLAPSE = 2; // only the multi-worktree case; leave single-repo windows alone
+    const POLL_INTERVAL_MS = 400; // how often to re-check for populated repos
+    const MAX_POLLS = 25; // ~10s ceiling — enough for git to discover worktrees on a cold reload
+
+    // Poll until repos have populated (≥2), then collapse once. If they never reach 2 within the window we
+    // simply give up (a 0/1-repo window has no worktree pile-up to tidy).
+    let polls = 0;
+    const timer = setInterval(async () => {
+        polls++;
+        if (done) {
+            clearInterval(timer);
+            return;
+        }
+        if (getOpenRepositoryCount() >= MIN_REPOS_TO_COLLAPSE) {
+            done = true;
+            clearInterval(timer);
+            await collapseScmRepositories();
+        } else if (polls >= MAX_POLLS) {
+            clearInterval(timer); // timed out — no multi-worktree situation, nothing to do
+        }
+    }, POLL_INTERVAL_MS);
+    // Make sure the poll timer is torn down if the extension deactivates mid-poll.
+    context.subscriptions.push(new vscode.Disposable(() => clearInterval(timer)));
+
+    // Startup window listener: worktrees that open shortly AFTER the first collapse (git discovers repos
+    // in waves) should also be folded. We only honour this for a short window after activation so that
+    // opening a repo deliberately later in the session isn't collapsed out from under the user.
+    const STARTUP_WINDOW_MS = 12000; // re-collapse late worktrees for ~12s after activation, then stop
+    const activatedAt = Date.now();
+    try {
+        const git = vscode.extensions.getExtension<any>("vscode.git")?.exports?.getAPI(1);
+        if (git?.onDidOpenRepository) {
+            let reCollapseTimer: ReturnType<typeof setTimeout> | undefined;
+            const sub = git.onDidOpenRepository(() => {
+                if (Date.now() - activatedAt > STARTUP_WINDOW_MS) {
+                    return; // past the startup window — respect the user's manual repo opens
+                }
+                // Debounce: several worktrees can open in the same tick; collapse once after they settle.
+                if (reCollapseTimer) {
+                    clearTimeout(reCollapseTimer);
+                }
+                reCollapseTimer = setTimeout(() => {
+                    void collapseScmRepositories();
+                }, 600);
+            });
+            context.subscriptions.push(sub);
+        }
+    } catch {
+        // git API not available / different shape — the poll loop above is the primary path anyway.
+    }
+};
+
 export function activate(context: vscode.ExtensionContext) {
     // Create the last-staged status bar item. Left alignment + priority 100 puts it on the left cluster at a
     // reasonable position. Starts HIDDEN — there's nothing to show until the first stage of the session. Its
@@ -95,6 +231,14 @@ export function activate(context: vscode.ExtensionContext) {
     // file WITHOUT navigating. Contributed to the editor/title menu in package.json so it renders as an icon.
     let disposable8 = vscode.commands.registerCommand("better-git-vscode.stage-current-file", async () => {
         await stageCurrentFile();
+    });
+
+    // Manual trigger for collapsing all SCM repository/worktree section headers (see the big comment block
+    // above `activate`). Ethan can bind this to a key or run it from the palette any time the worktree
+    // sections have crept back open. Unlike the auto-on-startup path this has NO ≥2-repo gate — if you ask
+    // for it explicitly, we collapse whatever's there.
+    let disposable14 = vscode.commands.registerCommand("better-git-vscode.collapse-worktrees", async () => {
+        await collapseScmRepositories();
     });
 
     // ──────────────────────────────────────────────────────────────────────────────────────────
@@ -328,9 +472,14 @@ export function activate(context: vscode.ExtensionContext) {
         }
     });
 
+    // Kick off the collapse-worktrees-on-startup routine (gated by setting + ≥2 repos). This is async and
+    // self-tearing-down; it does NOT block activation. See the big comment block above `activate` for the
+    // timing/populate + reveal-SCM caveats.
+    runCollapseWorktreesOnStartup(context);
+
     context.subscriptions.push(
         disposable, disposable2, disposable3, disposable4, disposable5, disposable6, disposable7, disposable8,
-        disposable9, disposable10, disposable11, disposable12, disposable13,
+        disposable9, disposable10, disposable11, disposable12, disposable13, disposable14,
         lastStagedStatusBarItem, // disposed cleanly on deactivate
         configListener,
         reviewDecoEmitter,
@@ -599,7 +748,13 @@ const getFileChanges = async (): Promise<FileChange[]> => {
     const gitExtension = vscode.extensions.getExtension<any>("vscode.git")!.exports;
     const git = gitExtension.getAPI(1);
     const workspaceUri = vscode.workspace.workspaceFolders?.map((ws) => ws.uri)[0];
-    const activeRepo = git.getRepository(workspaceUri?.path) || git.repositories[0];
+    // Prefer the repo that owns the file CURRENTLY BEING REVIEWED (tab-derived, focus-independent) so a
+    // multi-root workspace navigates within the right repo — falling through from a file in repo B used to
+    // build repo A's list, miss the file (findCurrentIndex -1) and silently stop (Codex review, v1.2.1).
+    // Fall back to the first workspace folder's repo / first known repo, as before.
+    const reviewUri = currentReviewFileUri();
+    const activeRepo =
+        (reviewUri && git.getRepository(reviewUri)) || git.getRepository(workspaceUri?.path) || git.repositories[0];
     const isTreeView = vscode.workspace.getConfiguration("better-git-vscode").get("treeView");
 
     // Keep the git status alongside the uri for staged entries: openChangeEntry needs it to choose which
@@ -663,7 +818,21 @@ const getActiveChange = async (): Promise<ActiveChange | null> => {
         return { path: mergeInput.result.path as string, staged: false };
     }
 
-    // Fallback for plain editors / non-textual files: path only, side unknown.
+    // PLAIN single-editor tab (v1.2.1 fix): resolve the path from the TAB itself, focus-independently.
+    // Two change kinds open as plain tabs: untracked new files (file: uri) and DELETED files (their HEAD
+    // content under a git: uri — toFilePathUri decodes the real path from the git: query). The old code
+    // fell straight through to getActiveFilePath(), which reads vscode.window.activeTextEditor — the
+    // FOCUSED editor, which can be a stale different-file editor when focus is in the SCM panel. That stale
+    // path then missed in findCurrentIndex (-1 -> bail), making next-change a hard silent no-op on deleted
+    // files. Tab-first resolution fixes it; side stays null (a plain tab doesn't tell staged vs unstaged).
+    if (input instanceof vscode.TabInputText) {
+        const resolved = toFilePathUri(input.uri);
+        if (resolved) {
+            return { path: resolved.path, staged: null };
+        }
+    }
+
+    // Fallback for non-textual files (images etc.): path only, side unknown.
     const path = await getActiveFilePath();
     return path ? { path, staged: null } : null;
 };
@@ -736,12 +905,31 @@ const getEmptyTreeRef = async (uri: vscode.Uri): Promise<string | undefined> => 
 const openChangeEntry = async (entry: FileChange): Promise<void> => {
     if (!entry.staged) {
         // Working-tree (unstaged) diff — git.openChange opens this side correctly, including untracked/new
-        // files (it shows them as a diff against an empty original, the same as clicking the row). Defensive
-        // fallback: if a diff genuinely can't be produced, open the file itself so the command never no-ops.
+        // files (it shows them as a plain editor, the same as clicking the row). Defensive fallback: if a
+        // view genuinely can't be produced, open the file itself so the command never no-ops.
         try {
             await vscode.commands.executeCommand("git.openChange", entry.uri);
         } catch {
             await vscode.window.showTextDocument(entry.uri, { preview: true });
+        }
+        // SILENT-NO-OP GUARD (Codex review, v1.2.1): with git.untrackedChanges="separate", untracked files
+        // live in the separate untracked group and git.openChange(uri) resolves nothing for them — and it
+        // does NOT throw, so the catch above never fires and navigation would just... stay put. Verify the
+        // active tab actually shows the requested file now; if not, open it directly. (uriFilePathOfTab
+        // logic: reuse currentReviewFileUri-style tab reading via activeTab input.)
+        const shownInput: unknown = vscode.window.tabGroups.activeTabGroup.activeTab?.input;
+        const shownUri =
+            shownInput instanceof vscode.TabInputTextDiff
+                ? toFilePathUri(shownInput.modified) ?? toFilePathUri(shownInput.original)
+                : shownInput instanceof vscode.TabInputText
+                    ? toFilePathUri(shownInput.uri)
+                    : undefined;
+        if (!shownUri || shownUri.path.toLowerCase() !== entry.uri.path.toLowerCase()) {
+            try {
+                await vscode.window.showTextDocument(entry.uri, { preview: true });
+            } catch {
+                // file unreadable (e.g. binary/permission edge) — nothing more we can do, but we tried both paths
+            }
         }
         return;
     }
@@ -897,54 +1085,133 @@ const openPreviousFile = async () => {
     await vscode.commands.executeCommand("workbench.action.compareEditor.previousChange");
 };
 
-// NEW-FILE detection (Ethan 2026-07-03): a file is "fully added" when its entire content is one big
-// new-diff — i.e. its git status is a whole-new-file state with NO original side to diff against:
-// untracked (Status.UNTRACKED), staged-new (INDEX_ADDED), or intent-to-add (INTENT_TO_ADD). For those,
-// VS Code's compareEditor.nextChange sees a single file-spanning change and jumps straight past it, so you
-// can't actually read a brand-new file top-to-bottom with next/previous. When true, goToNextDiff/
-// goToPreviousDiff step by a fixed number of lines instead (see the newFileNavLineJump setting).
-// Resolves any diff-side/editor uri to the on-disk path first (via toFilePathUri) so it works whether the
-// new file opened as a PLAIN editor (untracked -> vscode.open, no original) or an empty-original DIFF
-// (staged INDEX_ADDED -> empty-tree vs index).
+// NEW-FILE detection (Ethan 2026-07-03, HARDENED in v1.2.1): a file is "fully added" when its entire
+// content is one big new-diff — i.e. its git status is a whole-new-file state with NO original content:
+// untracked (Status.UNTRACKED), staged-new (INDEX_ADDED), or intent-to-add (INTENT_TO_ADD).
+//
+// v1.2.1 ROOT-CAUSE FIXES baked in here (the v1.2.0 version of this check caused the "next-change stopped
+// advancing / 5-line jump fired on modified files" regression):
+//   • DUAL-STATE GUARD: a file staged as new (INDEX_ADDED) and then edited again is ALSO a working-tree
+//     MODIFIED change — its working-tree diff has real hunks, so it must use normal hunk navigation. The
+//     old check returned true purely because an INDEX_ADDED entry existed, hijacking hunk nav into 5-line
+//     crawling. Now ANY non-new working-tree status (MODIFIED / DELETED / renamed / type-changed / conflict)
+//     vetoes new-file mode outright.
+//   • NO REPO GUESSING: the old `getRepository(uri) ?? repositories[0]` fell back to the FIRST repo when the
+//     lookup missed, so a multi-repo workspace could consult the wrong repo's change lists. Now: no owning
+//     repo (or git API not ready) -> false -> normal navigation. Never a silent no-op.
+//   • file:-scheme only: a DELETED file's "editor" is HEAD content under a git: uri — resolving it to the
+//     on-disk path and then status-matching could never be a whole-new-file state, but we guard the scheme
+//     explicitly anyway so deleted/virtual views can't even reach the status lookup.
 const isFullyAddedFile = (uri: vscode.Uri | undefined): boolean => {
     const fileUri = toFilePathUri(uri);
-    if (!fileUri) {
+    if (!fileUri || fileUri.scheme !== "file") {
         return false;
     }
     try {
         const git = vscode.extensions.getExtension<any>("vscode.git")?.exports?.getAPI(1);
-        const repo = git?.getRepository(fileUri) ?? git?.repositories?.[0];
+        // Only trust the repo that actually CONTAINS this file — see NO REPO GUESSING note above.
+        const repo = git?.getRepository(fileUri);
         if (!repo) {
             return false;
         }
         const p = fileUri.path.toLowerCase();
         const find = (changes: any[]) => (changes ?? []).find((c: any) => c.uri.path.toLowerCase() === p);
-        // Untracked files live in state.untrackedChanges (all UNTRACKED = the whole file is new).
+        // Working-tree entry first, because it can VETO. With the default git.untrackedChanges="mixed",
+        // untracked files land here with status UNTRACKED; `git add -N` files land here as INTENT_TO_ADD.
+        const wt = find(repo.state.workingTreeChanges);
+        const wtIsNew = wt && (wt.status === GitStatus.UNTRACKED || wt.status === GitStatus.INTENT_TO_ADD);
+        if (wt && !wtIsNew) {
+            // Tracked working-tree change (MODIFIED / DELETED / INTENT_TO_RENAME / TYPE_CHANGED / ...):
+            // there IS original content to diff against -> normal hunk navigation. This is the dual-state
+            // guard: it fires even if the file is simultaneously INDEX_ADDED in the index.
+            return false;
+        }
+        if (wtIsNew) {
+            return true;
+        }
+        // git.untrackedChanges="separate" keeps untracked files in their own list — everything in it is
+        // by definition a whole-new file.
         if (find(repo.state.untrackedChanges)) {
             return true;
         }
-        // Staged-new / intent-to-add appear in indexChanges with a whole-new-file status.
+        // Staged brand-new file with NO working-tree entry at all (clean since staging): the index entry
+        // must be a whole-new-file status. INDEX_DELETED / INDEX_RENAMED / INDEX_MODIFIED etc. all fail
+        // this check — renames are git's classic "delete+add" trap and must navigate normally.
         const idx = find(repo.state.indexChanges);
-        if (idx && (idx.status === GitStatus.INDEX_ADDED || idx.status === GitStatus.INTENT_TO_ADD)) {
-            return true;
-        }
-        // Depending on the git.untrackedChanges setting, untracked / intent-to-add can also land in workingTreeChanges.
-        const wt = find(repo.state.workingTreeChanges);
-        if (wt && (wt.status === GitStatus.UNTRACKED || wt.status === GitStatus.INTENT_TO_ADD)) {
-            return true;
-        }
-        return false;
+        return !!idx && (idx.status === GitStatus.INDEX_ADDED || idx.status === GitStatus.INTENT_TO_ADD);
     } catch {
         return false; // git API not ready / shape changed — fall back to normal change navigation
     }
+};
+
+// Resolves the TextEditor OBJECT that is actually rendering the active TAB's document (for a side-by-side
+// diff: its MODIFIED/right side; for a plain tab: that document's editor). This is NOT the same thing as
+// vscode.window.activeTextEditor — that is the *focused* editor (or the most recently focused one), and in
+// Ethan's review flow keyboard focus frequently sits in the Source Control panel: SCM single-clicks open
+// files with preserveFocus:true, so activeTextEditor can keep pointing at a completely DIFFERENT file.
+// THE v1.2.0 BUG: goToNextDiff decided "new file? -> step" from the active tab but then stepped
+// vscode.window.activeTextEditor — when the two disagreed, the cursor moved invisibly in a stale/hidden
+// editor (perceived hard no-op, "not going to next change") or 5-line-stepped a MODIFIED file's editor.
+// Navigation must decide AND act on the same tab-derived editor; this helper is that single source of truth.
+const visibleEditorForActiveTab = (): vscode.TextEditor | undefined => {
+    const input = vscode.window.tabGroups.activeTabGroup.activeTab?.input;
+    let target: vscode.Uri | undefined;
+    if (input instanceof vscode.TabInputTextDiff) {
+        target = input.modified; // change-navigation moves the cursor on the right/modified side
+    } else if (input instanceof vscode.TabInputText) {
+        target = input.uri;
+    }
+    if (!target) {
+        return undefined; // webview / binary / merge tab — no plain text editor to resolve
+    }
+    const key = target.toString();
+    // uri.toString() compares scheme + path + query, so the two git:-scheme sides of a staged diff (same
+    // path, different ref in the query) cannot be confused with each other or with the on-disk file.
+    return vscode.window.visibleTextEditors.find((e) => e.document.uri.toString() === key);
+};
+
+// THE STRUCTURAL GATE for new-file scroll mode (v1.2.1). Returns the editor to 5-line-step through, or
+// undefined meaning "use normal navigation". ALL FOUR conditions must hold:
+//   (a) the active tab is a PLAIN single editor (TabInputText) — NOT a side-by-side diff. A diff tab means
+//       an original side exists, so hunk navigation applies. This alone makes it structurally IMPOSSIBLE
+//       for a MODIFIED file (which always opens as a diff) to get the 5-line step — the exact v1.2.0
+//       regression Ethan reproduced. Trade-off accepted: a staged-new file opened as its empty-original
+//       DIFF now falls through to normal nav (advances to the next file) instead of stepping; opening the
+//       plain file still steps. Never compromise modified-file navigation for that case.
+//   (b) the tab shows the ON-DISK file (file: scheme). A DELETED file also opens as a plain editor, but of
+//       the HEAD blob under a git: uri — its content is REMOVED, not added, so it must never scroll-step.
+//   (c) git confirms the whole file is genuinely new (isFullyAddedFile above, with its dual-state guard).
+//   (d) a visible TextEditor for that exact document exists — we only ever step the editor the user is
+//       LOOKING at. No match (races, weird layouts) -> undefined -> normal navigation, never a silent no-op.
+const newFileScrollEditor = (): vscode.TextEditor | undefined => {
+    const tab = vscode.window.tabGroups.activeTabGroup.activeTab;
+    if (!(tab?.input instanceof vscode.TabInputText)) {
+        return undefined; // (a) not a plain single-editor tab
+    }
+    const uri = tab.input.uri;
+    if (uri.scheme !== "file") {
+        return undefined; // (b) deleted-file / virtual-document guard
+    }
+    if (!isFullyAddedFile(uri)) {
+        return undefined; // (c) not a genuinely brand-new file
+    }
+    const key = uri.toString();
+    return vscode.window.visibleTextEditors.find((e) => e.document.uri.toString() === key); // (d)
 };
 
 // Shared step logic for new-file scroll mode: move the cursor `direction` by newFileNavLineJump lines within
 // a fully-added file so you can page through it. Returns true if it stepped (caller stops), or false if the
 // cursor is already at the edge (caller falls through to the next/previous FILE — matching the normal
 // end-of-changes behaviour so the review flow keeps going).
-const stepThroughNewFile = (editor: vscode.TextEditor, direction: "down" | "up"): boolean => {
-    const step = vscode.workspace.getConfiguration("better-git-vscode").get<number>("newFileNavLineJump", 5);
+// v1.2.1: async + focuses the editor being stepped. An UNFOCUSED editor renders no caret, so when focus sat
+// in the SCM panel the old steps were invisible (part of the perceived "nothing happens"). We also reveal
+// InCenter (not InCenterIfOutsideViewport) so every press produces visible scroll feedback once the file is
+// taller than the viewport.
+const stepThroughNewFile = async (editor: vscode.TextEditor, direction: "down" | "up"): Promise<boolean> => {
+    const configured = vscode.workspace.getConfiguration("better-git-vscode").get<number>("newFileNavLineJump", 5);
+    // Guard bad user values: 0 / negative / NaN would "step" in place forever — a permanent no-op. Floor
+    // fractional values; anything non-usable falls back to the default 5.
+    const step = Number.isFinite(configured) && (configured as number) >= 1 ? Math.floor(configured as number) : 5;
     const cur = editor.selection.active.line;
     const last = Math.max(0, editor.document.lineCount - 1);
     const atEdge = direction === "down" ? cur >= last : cur <= 0;
@@ -952,9 +1219,18 @@ const stepThroughNewFile = (editor: vscode.TextEditor, direction: "down" | "up")
         return false;
     }
     const target = direction === "down" ? Math.min(cur + step, last) : Math.max(cur - step, 0);
+    // Focus the editor we're about to step (safe here: the gate guarantees a plain file: document, never a
+    // diff side or virtual doc). showTextDocument on an already-visible document re-uses its tab/column.
+    // If focusing fails for any reason, still step the unfocused editor — movement over silence.
+    let stepEditor = editor;
+    try {
+        stepEditor = await vscode.window.showTextDocument(editor.document, { viewColumn: editor.viewColumn, preserveFocus: false });
+    } catch {
+        // keep the unfocused editor — the selection/reveal below still applies
+    }
     const pos = new vscode.Position(target, 0);
-    editor.selection = new vscode.Selection(pos, pos);
-    editor.revealRange(new vscode.Range(target, 0, target, 0), vscode.TextEditorRevealType.InCenterIfOutsideViewport);
+    stepEditor.selection = new vscode.Selection(pos, pos);
+    stepEditor.revealRange(new vscode.Range(target, 0, target, 0), vscode.TextEditorRevealType.InCenter);
     return true;
 };
 
@@ -966,21 +1242,30 @@ const goToNextDiff = async () => {
         return;
     }
 
-    // NEW-FILE SCROLL MODE: for a fully-added new file (whole file is one new-diff), compareEditor.nextChange
-    // can only jump past the single file-spanning change — so instead step DOWN newFileNavLineJump lines to
-    // page through the new file. When we hit the bottom, fall through to the next changed file (same as
-    // running out of changes normally).
-    if (activeEditor && isFullyAddedFile(currentReviewFileUri() ?? activeEditor.document.uri)) {
-        if (stepThroughNewFile(activeEditor, "down")) {
+    // NEW-FILE SCROLL MODE: for a brand-new file shown as a PLAIN editor (whole file is one new-diff with
+    // no original side), step DOWN newFileNavLineJump lines to page through it; at the bottom fall through
+    // to the next changed file. newFileScrollEditor() is the strict v1.2.1 gate — it both DECIDES (plain
+    // tab + file: scheme + genuinely-new git status) and RESOLVES the editor to act on (the tab's own
+    // visible editor, never a possibly-stale vscode.window.activeTextEditor). The v1.2.0 code split those
+    // two concerns across different editors, which is what made modified files 5-line-step and new files
+    // silently no-op — see the comments on isFullyAddedFile / newFileScrollEditor for the full post-mortem.
+    const newFileEditor = newFileScrollEditor();
+    if (newFileEditor) {
+        if (await stepThroughNewFile(newFileEditor, "down")) {
             return;
         }
         await openNextFile();
         return;
     }
 
-    const lineBefore = activeEditor?.selection.active.line;
+    // Hunk navigation. Read the cursor from the TAB's own editor (falling back to the focused editor) so
+    // the moved/didn't-move detection below works even when keyboard focus is in the SCM panel —
+    // activeTextEditor alone could be a stale different-file editor there, which made the before/after
+    // compare meaningless (always "didn't move" -> premature file jumps, or missed jumps).
+    const navEditor = visibleEditorForActiveTab() ?? activeEditor;
+    const lineBefore = navEditor?.selection.active.line;
     await vscode.commands.executeCommand("workbench.action.compareEditor.nextChange");
-    const lineAfter = activeEditor?.selection.active.line;
+    const lineAfter = navEditor?.selection.active.line; // TextEditor.selection is live — same object, post-command state
 
     if (lineBefore === undefined || lineAfter === undefined || !(lineAfter > lineBefore)) {
         // We've run out of changes in the current file. Jump straight to the next changed file —
@@ -1000,19 +1285,23 @@ const goToPreviousDiff = async () => {
         return;
     }
 
-    // NEW-FILE SCROLL MODE (mirror of goToNextDiff): step UP newFileNavLineJump lines through a fully-added
-    // file; at the top, fall through to the previous changed file.
-    if (activeEditor && isFullyAddedFile(currentReviewFileUri() ?? activeEditor.document.uri)) {
-        if (stepThroughNewFile(activeEditor, "up")) {
+    // NEW-FILE SCROLL MODE (mirror of goToNextDiff — same strict v1.2.1 gate, see comments there): step UP
+    // newFileNavLineJump lines through a brand-new plain-editor file; at the top, fall through to the
+    // previous changed file.
+    const newFileEditor = newFileScrollEditor();
+    if (newFileEditor) {
+        if (await stepThroughNewFile(newFileEditor, "up")) {
             return;
         }
         await openPreviousFile();
         return;
     }
 
-    const lineBefore = activeEditor?.selection.active.line;
+    // Hunk navigation — tab-derived editor for the before/after compare, same rationale as goToNextDiff.
+    const navEditor = visibleEditorForActiveTab() ?? activeEditor;
+    const lineBefore = navEditor?.selection.active.line;
     await vscode.commands.executeCommand("workbench.action.compareEditor.previousChange");
-    const lineAfter = activeEditor?.selection.active.line;
+    const lineAfter = navEditor?.selection.active.line; // live selection — post-command state
 
     if (lineBefore === undefined || lineAfter === undefined || !(lineAfter < lineBefore)) {
         // Out of changes in the current file -> jump straight to the previous changed file, NO prompt.

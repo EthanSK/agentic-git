@@ -6,7 +6,12 @@ export async function run(): Promise<void> {
 	// Create the mocha test
 	const mocha = new Mocha({
 		ui: 'tdd',
-		color: true
+		color: true,
+		// E2E tests drive a real VS Code window + real git subprocesses + the git extension's async state
+		// refreshes — individual tests legitimately take multiple seconds. The default 2s mocha timeout
+		// would flake constantly, so give each test a generous budget; the polling helpers inside the
+		// tests keep the HAPPY path fast (they resolve as soon as the condition is met).
+		timeout: 60_000
 	});
 
 	const testsRoot = path.resolve(__dirname, '..');
