@@ -29,7 +29,7 @@ Each entry looks like:
 **Symptom:** Editor-title '+' button only STAGED the current file — Ethan then had to grab the keyboard to jump to the next change, breaking the mouse-only review flow.
 **Root cause:** The editor/title menu pointed at better-git-vscode.stage-current-file (stage, no navigate); there was no mouse path that both staged and advanced, and no memory of which direction (next/previous) he was reviewing in.
 **Fix:** src/extension.ts: added module-level lastNavDirection ('next'|'previous', default 'next') set by next/previous-scm-change, next/previous-changed-file, and stage-and-next/previous (NOT the smart mouse cmds — their in-diff direction is intentionally flipped). New command better-git-vscode.stage-current-file-and-advance calls the SAME stageCurrentFileAndAdvance(lastNavDirection) that the Shift+Alt+./,keyboard shortcuts use. package.json editor/title menu repointed from stage-current-file to stage-current-file-and-advance (kept $(add) icon + gitOpenRepositoryCount!=0 when-clause). stage-current-file stays registered for anyone who bound it.
-**Commit:** pending-on-branch
+**Commit:** b88e635 (PR #16, squash-merged; published as v1.2.7)
 **Guard:** stageCurrentFileAndAdvance's isChangedFile guard makes the button a safe no-op on non-change editors (never errors). Both keyboard cmds and the button share one function (no fork). Thorough comments at the lastNavDirection decl + each nav command + the new command registration. lint+tsc+package green.
 ---
 
