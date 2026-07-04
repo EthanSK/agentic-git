@@ -53,6 +53,142 @@ const stageThroughExtension = async (repo: any, uri: vscode.Uri): Promise<void> 
     recordLastStaged(uri); // success -> update the status bar with the file we just staged
 };
 
+// ──────────────────────────────────────────────────────────────────────────────────────────
+// COLLAPSE WORKTREES / REPOSITORY SECTIONS ON STARTUP (v1.2.2)
+//
+// WHY this exists (Ethan's exact request): he works with git WORKTREES (e.g.
+// ~/Documents/claude-worktrees/<project>-<name>). When multiple worktrees / repositories are open in
+// one window, VS Code's built-in Source Control view renders EACH repository as its own collapsible
+// section header. On every window open / reload those sections all render EXPANDED — noisy when you
+// have several worktrees. He wants them collapsed by default so the SCM panel stays tidy.
+//
+// HOW we do it — the ONLY reliable command that exists (verified against the shipped VS Code bundle,
+// src/vs/workbench/contrib/scm/):
+//   `workbench.scm.action.collapseAllRepositories`
+// Its handler literally iterates `scmViewService.visibleRepositories` and collapses every collapsible
+// one (the repo/worktree section headers) — exactly the annoyance. There is NO public extension API to
+// PERSIST or DEFAULT the SCM repository collapse state (no `scm.defaultViewMode`-style setting for repo
+// headers), so calling this command on startup is the closest available workaround. (There is also a
+// generic `workbench.scm.action.collapseAll` which collapses resource GROUPS inside a repo, not the repo
+// headers — not what we want. `git.collapseAll` does not exist.)
+//
+// CRITICAL CAVEAT #1 — the command is a VIEW ACTION: its handler resolves the target view via
+// `getActiveViewWithId("workbench.scm")`, which only returns the view when the Source Control viewlet is
+// the ACTIVE (currently-open) sidebar container. If SCM isn't the active view, the command silently
+// no-ops. So we MUST reveal SCM first (`workbench.view.scm`) and only THEN collapse. This does bring the
+// Source Control panel to the foreground — acceptable here because this whole extension is a git-diff
+// review tool and Ethan is looking at worktree changes on reload anyway; and we only auto-run it when
+// there are actually ≥2 repositories (the multi-worktree annoyance), so a single-repo window is left
+// untouched and unfocused.
+//
+// CRITICAL CAVEAT #2 — TIMING / POPULATE: the git extension discovers repositories asynchronously after
+// window load, and the SCM tree must have the repo nodes present before there's anything to collapse.
+// So the startup path POLLS the git API until repositories appear (or a timeout), then collapses; and it
+// also listens (briefly, only during a startup window) for late-appearing worktrees so those get
+// collapsed too. All best-effort and wrapped in try/catch — if the command doesn't exist on an old host,
+// or the git API isn't ready, we no-op safely and never break activation.
+
+// The built-in command id that collapses all SCM repository/worktree section headers. Kept as a const so
+// there's a single source of truth and it's easy to find/grep.
+const SCM_COLLAPSE_ALL_REPOS_COMMAND = "workbench.scm.action.collapseAllRepositories";
+
+// Reveal the Source Control view (required — see CAVEAT #1) then run the collapse-all-repositories
+// command. Returns true if the collapse command was dispatched without throwing. Fully defensive: any
+// failure (command missing on an old host, view not resolvable) is swallowed so it can never break
+// startup or a manual invocation.
+const collapseScmRepositories = async (): Promise<boolean> => {
+    try {
+        // Must make SCM the active sidebar container first, otherwise the view action can't resolve its
+        // target view and no-ops. This focuses the Source Control panel.
+        await vscode.commands.executeCommand("workbench.view.scm");
+        // Now the collapse command has a live view to act on — collapses every repo/worktree header.
+        await vscode.commands.executeCommand(SCM_COLLAPSE_ALL_REPOS_COMMAND);
+        return true;
+    } catch {
+        // Old VS Code without this command id, or the view wasn't resolvable — do nothing, safely.
+        return false;
+    }
+};
+
+// Reads the git API and returns how many repositories/worktrees VS Code currently has open (0 if the git
+// extension isn't ready yet). Used to (a) decide whether the multi-worktree annoyance even applies and
+// (b) poll until repos have populated before collapsing.
+const getOpenRepositoryCount = (): number => {
+    try {
+        const git = vscode.extensions.getExtension<any>("vscode.git")?.exports?.getAPI(1);
+        return git?.repositories?.length ?? 0;
+    } catch {
+        return 0; // git extension not present / API shape changed — treat as "no repos"
+    }
+};
+
+// The auto-on-startup routine. Gated by the `collapseWorktreesOnStartup` setting (default true) and by
+// there being ≥2 repositories (a single repo isn't the "lots of expanded worktrees" annoyance, and we
+// don't want to steal focus / hide the only repo's changes for it). Because repos populate async, we
+// POLL for them, then collapse. We ALSO briefly watch `onDidOpenRepository` so worktrees that finish
+// opening AFTER our first collapse still get folded — but only within a short startup window, so opening
+// a repo later in the session (deliberately) never yanks its section closed under the user.
+const runCollapseWorktreesOnStartup = (context: vscode.ExtensionContext): void => {
+    const enabled = vscode.workspace
+        .getConfiguration("better-git-vscode")
+        .get<boolean>("collapseWorktreesOnStartup", true);
+    if (!enabled) {
+        return; // user opted out — never auto-collapse, but the manual command still works
+    }
+
+    let done = false; // guard so we collapse at most once from the poll loop
+    const MIN_REPOS_TO_COLLAPSE = 2; // only the multi-worktree case; leave single-repo windows alone
+    const POLL_INTERVAL_MS = 400; // how often to re-check for populated repos
+    const MAX_POLLS = 25; // ~10s ceiling — enough for git to discover worktrees on a cold reload
+
+    // Poll until repos have populated (≥2), then collapse once. If they never reach 2 within the window we
+    // simply give up (a 0/1-repo window has no worktree pile-up to tidy).
+    let polls = 0;
+    const timer = setInterval(async () => {
+        polls++;
+        if (done) {
+            clearInterval(timer);
+            return;
+        }
+        if (getOpenRepositoryCount() >= MIN_REPOS_TO_COLLAPSE) {
+            done = true;
+            clearInterval(timer);
+            await collapseScmRepositories();
+        } else if (polls >= MAX_POLLS) {
+            clearInterval(timer); // timed out — no multi-worktree situation, nothing to do
+        }
+    }, POLL_INTERVAL_MS);
+    // Make sure the poll timer is torn down if the extension deactivates mid-poll.
+    context.subscriptions.push(new vscode.Disposable(() => clearInterval(timer)));
+
+    // Startup window listener: worktrees that open shortly AFTER the first collapse (git discovers repos
+    // in waves) should also be folded. We only honour this for a short window after activation so that
+    // opening a repo deliberately later in the session isn't collapsed out from under the user.
+    const STARTUP_WINDOW_MS = 12000; // re-collapse late worktrees for ~12s after activation, then stop
+    const activatedAt = Date.now();
+    try {
+        const git = vscode.extensions.getExtension<any>("vscode.git")?.exports?.getAPI(1);
+        if (git?.onDidOpenRepository) {
+            let reCollapseTimer: ReturnType<typeof setTimeout> | undefined;
+            const sub = git.onDidOpenRepository(() => {
+                if (Date.now() - activatedAt > STARTUP_WINDOW_MS) {
+                    return; // past the startup window — respect the user's manual repo opens
+                }
+                // Debounce: several worktrees can open in the same tick; collapse once after they settle.
+                if (reCollapseTimer) {
+                    clearTimeout(reCollapseTimer);
+                }
+                reCollapseTimer = setTimeout(() => {
+                    void collapseScmRepositories();
+                }, 600);
+            });
+            context.subscriptions.push(sub);
+        }
+    } catch {
+        // git API not available / different shape — the poll loop above is the primary path anyway.
+    }
+};
+
 export function activate(context: vscode.ExtensionContext) {
     // Create the last-staged status bar item. Left alignment + priority 100 puts it on the left cluster at a
     // reasonable position. Starts HIDDEN — there's nothing to show until the first stage of the session. Its
@@ -95,6 +231,14 @@ export function activate(context: vscode.ExtensionContext) {
     // file WITHOUT navigating. Contributed to the editor/title menu in package.json so it renders as an icon.
     let disposable8 = vscode.commands.registerCommand("better-git-vscode.stage-current-file", async () => {
         await stageCurrentFile();
+    });
+
+    // Manual trigger for collapsing all SCM repository/worktree section headers (see the big comment block
+    // above `activate`). Ethan can bind this to a key or run it from the palette any time the worktree
+    // sections have crept back open. Unlike the auto-on-startup path this has NO ≥2-repo gate — if you ask
+    // for it explicitly, we collapse whatever's there.
+    let disposable14 = vscode.commands.registerCommand("better-git-vscode.collapse-worktrees", async () => {
+        await collapseScmRepositories();
     });
 
     // ──────────────────────────────────────────────────────────────────────────────────────────
@@ -328,9 +472,14 @@ export function activate(context: vscode.ExtensionContext) {
         }
     });
 
+    // Kick off the collapse-worktrees-on-startup routine (gated by setting + ≥2 repos). This is async and
+    // self-tearing-down; it does NOT block activation. See the big comment block above `activate` for the
+    // timing/populate + reveal-SCM caveats.
+    runCollapseWorktreesOnStartup(context);
+
     context.subscriptions.push(
         disposable, disposable2, disposable3, disposable4, disposable5, disposable6, disposable7, disposable8,
-        disposable9, disposable10, disposable11, disposable12, disposable13,
+        disposable9, disposable10, disposable11, disposable12, disposable13, disposable14,
         lastStagedStatusBarItem, // disposed cleanly on deactivate
         configListener,
         reviewDecoEmitter,

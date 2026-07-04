@@ -24,6 +24,16 @@ Each entry looks like:
 (newest first)
 
 ---
+**Date:** 2026-07-04T11:58:23Z
+**Trigger:** Ethan request: 'make better-git-vscode minimize the worktrees if there are any when opening / reloading window'
+**Symptom:** Git worktrees / multiple repos render EXPANDED in the Source Control panel on every window open/reload; noisy with several worktrees
+**Root cause:** VS Code has no public API to persist/default the SCM repository/worktree section collapse state (upstream microsoft/vscode#322318). The only built-in that collapses the repo section headers is the view action workbench.scm.action.collapseAllRepositories, which no-ops unless the Source Control view is the ACTIVE sidebar (its handler resolves the target via getActiveViewWithId('workbench.scm')). Repos also populate asynchronously, so collapsing too early finds nothing to collapse.
+**Fix:** v1.2.2: collapseScmRepositories() reveals SCM via workbench.view.scm THEN runs workbench.scm.action.collapseAllRepositories (both in try/catch). runCollapseWorktreesOnStartup() polls the git API (getAPI(1).repositories.length) every 400ms up to ~10s, only collapses when >=2 repos, and briefly listens to onDidOpenRepository for ~12s to catch late worktrees. Added setting better-git-vscode.collapseWorktreesOnStartup (default true) + manual command better-git-vscode.collapse-worktrees.
+**Commit:** pending-on-branch-feat/collapse-worktrees-on-startup
+**Guard:** Command id verified against the shipped VS Code bundle (workbench.desktop.main.js: id 'workbench.scm.action.collapseAllRepositories', runInView -> collapseAllRepositories() iterating visibleRepositories). Thorough comments in extension.ts above activate() document both caveats (reveal-required view action + async populate). No unit test (needs a live VS Code host + multiple worktrees — Mini verifies).
+---
+
+---
 **Date:** 2026-07-03T00:46:34Z
 **Trigger:** Ethan voice 2026-07-03 'glitchy as fuck... worked once and now it's just not going to next change' + follow-ups (5-line jump on modified files, deleted file does nothing)
 **Symptom:** v1.2.0 'scroll through newly-added files' glitchy: next-scm-change stopped advancing (perceived no-op), 5-line jump wrongly fired on MODIFIED files, deleted files dead-ended navigation
