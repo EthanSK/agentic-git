@@ -29,7 +29,7 @@ Each entry looks like:
 **Symptom:** Want to keep the primary/main SCM repository expanded while collapsing only the other git worktrees in VS Code's Source Control view
 **Root cause:** VS Code exposes NO command to collapse or expand a SINGLE repository — only workbench.scm.action.collapseAllRepositories / expandAllRepositories which iterate scmViewService.visibleRepositories and act on ALL at once. The per-node tree.collapse()/tree.expand() are internal to SCMView, unreachable from an extension.
 **Fix:** Collapse all repos, then re-expand ONLY the primary by leveraging VS Code's built-in scm.autoReveal: SCMView.onDidActiveEditorChange calls tree.expandTo(resource) (expands all ancestors incl the repo header) for the active editor's matching SCM resource. So after collapseAllRepositories, open one of the PRIMARY repo's changed files (showTextDocument, preview+preserveFocus) to fire auto-reveal and re-expand just that repo's section. Detect primary = repo whose rootUri matches workspaceFolders[0] (worktrees live outside the folder), fallback git.repositories[0]. Small setTimeout(120ms) so the reveal lands after the collapse on the tree-op sequencer.
-**Commit:** pending
+**Commit:** 3cc8b6f (v1.2.4, PR #13)
 **Guard:** Thoroughly commented in src/extension.ts (collapseWorktreesKeepingPrimaryExpanded + getPrimaryRepository + big WHY block). Limits documented: relies on scm.autoReveal (default on), opens a preview tab, primary with no changes stays collapsed.
 ---
 
