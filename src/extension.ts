@@ -258,6 +258,19 @@ const collapseWorktreesKeepingPrimaryExpanded = async (): Promise<void> => {
     if (!revealUri) {
         return; // primary has no changes -> no resource to reveal toward -> leave it collapsed (limitation #3)
     }
+    // BUG 12 FIX (v1.2.9 — late worktree collapses hijacked the diff the user was actively reviewing): this
+    // function runs on startup AND is re-fired (debounced) by onDidOpenRepository for ~12s as worktrees
+    // populate in waves. The Step-2 reveal below re-uses the shared PREVIEW tab (showTextDocument preview:true),
+    // so if the user has already navigated to a change in that preview tab, a late re-collapse would replace
+    // their current diff with the primary's first change out from under them. Guard: if a change-review tab is
+    // already active (currentReviewFileUri — the SAME shared "which file is under review" predicate the nav +
+    // badge use — resolves to a file), the user is mid-review, so SKIP the reveal. Their own navigation keeps
+    // firing SCM auto-reveal (expandTo) on whatever they open, so the primary re-expands the next time they
+    // land on one of its files — without us hijacking their diff. The FIRST startup collapse has no review open
+    // yet (currentReviewFileUri undefined), so it still lands on the primary's first change exactly as before.
+    if (currentReviewFileUri() !== undefined) {
+        return;
+    }
     try {
         // Let the collapse settle on the SCM view's internal tree-operation sequencer before we queue the
         // reveal, so the expandTo from auto-reveal lands AFTER the collapse (otherwise a race could collapse
@@ -701,9 +714,37 @@ const isChangeFileUri = (uri: vscode.Uri): boolean => {
         }
         const p = uri.path.toLowerCase();
         const inAny = (changes: any[]) => (changes ?? []).some((c: any) => c.uri.path.toLowerCase() === p);
-        return inAny(repo.state.indexChanges) || inAny(repo.state.workingTreeChanges) || inAny(repo.state.untrackedChanges);
+        // mergeChanges (unresolved conflicts) counts as a change too (Codex review 2026-07-04): with the
+        // DEFAULT git.mergeEditor=false a conflict opens as the plain working file, and this shared "is this a
+        // change?" predicate feeds currentReviewFileUri's plain/custom branches — so without mergeChanges a
+        // plain merge-conflict tab was invisible to repo-selection, the late-collapse guard, and the badge.
+        return (
+            inAny(repo.state.indexChanges) ||
+            inAny(repo.state.workingTreeChanges) ||
+            inAny(repo.state.untrackedChanges) ||
+            inAny(repo.state.mergeChanges)
+        );
     } catch {
         return false; // git extension not ready / API shape changed — just don't badge
+    }
+};
+
+// TRUE only when `uri` is specifically an UNRESOLVED MERGE CONFLICT (in repo.state.mergeChanges). Distinct
+// from isChangeFileUri (which is true for any change) because the smart-mouse gate must treat a plain
+// merge-conflict working-file editor as review WITHOUT also treating an ordinary modified file opened in a
+// plain editor as review — the latter is deliberately excluded from mouse change-nav so thumb-Back keeps its
+// normal browser-history meaning while you're editing. (Codex review 2026-07-04, plain-merge follow-up.)
+const isMergeConflictFileUri = (uri: vscode.Uri): boolean => {
+    try {
+        const git = vscode.extensions.getExtension<any>("vscode.git")?.exports?.getAPI(1);
+        const repo = git?.getRepository(uri) ?? git?.repositories?.[0];
+        if (!repo) {
+            return false;
+        }
+        const p = uri.path.toLowerCase();
+        return (repo.state.mergeChanges ?? []).some((c: any) => c.uri.path.toLowerCase() === p);
+    } catch {
+        return false; // git extension not ready / API shape changed
     }
 };
 
@@ -731,6 +772,19 @@ const toFilePathUri = (uri: vscode.Uri | undefined): vscode.Uri | undefined => {
     return uri.path ? vscode.Uri.file(uri.path) : undefined;
 };
 
+// SHARED merge-editor predicate (v1.2.9). A 3-way MERGE editor (git conflict) is a TabInputTextMerge tab.
+// That type exists at runtime but isn't in this project's @types/vscode (1.83), so we duck-type it by shape:
+// a merge input uniquely has `result` (the on-disk file being merged) + `input1` + `input2` (the two sides).
+// This exact duck-type used to be copy-pasted in THREE places (currentReviewFileUri, getActiveChange, and it
+// was MISSING from the smart-mouse gate — Bug 1, 2026-07-04: the mouse fell through to browser nav on a merge
+// conflict while the keyboard navigated the changeset). Extracted to ONE predicate so every entry point that
+// needs to recognise "is this the merge-conflict editor?" asks the SAME question — the mouse can't diverge
+// from the keyboard on merge conflicts again. Returns true only for a genuine merge tab (all three fields).
+const isMergeEditorInput = (input: unknown): boolean => {
+    const m = input as any;
+    return !!(m && m.result && m.input1 && m.input2);
+};
+
 const currentReviewFileUri = (): vscode.Uri | undefined => {
     const input = vscode.window.tabGroups.activeTabGroup.activeTab?.input;
     if (input instanceof vscode.TabInputTextDiff) {
@@ -740,12 +794,10 @@ const currentReviewFileUri = (): vscode.Uri | undefined => {
         // instead of special-casing each git status. (Bug: the badge didn't follow deleted files.)
         return toFilePathUri(input.modified) ?? toFilePathUri(input.original);
     }
-    // A 3-way MERGE editor (git conflict). TabInputTextMerge exists at runtime but isn't in this project's
-    // @types/vscode (1.83), so duck-type it by shape (base/input1/input2/result); `result` is the on-disk
-    // file being merged. The TabInputTextDiff check above already ran, so this shape is unambiguously a merge.
-    const mergeInput = input as any;
-    if (mergeInput && mergeInput.result && mergeInput.input1 && mergeInput.input2) {
-        return toFilePathUri(mergeInput.result);
+    // A 3-way MERGE editor (git conflict) — recognised via the shared isMergeEditorInput predicate. `result`
+    // is the on-disk file being merged. The TabInputTextDiff check above already ran, so this is unambiguous.
+    if (isMergeEditorInput(input)) {
+        return toFilePathUri((input as any).result);
     }
     // A single editor (not a diff) — git opens some changes this way via `vscode.open`:
     //   • untracked/new files  -> the plain file: uri (no original to diff against)
@@ -755,6 +807,18 @@ const currentReviewFileUri = (): vscode.Uri | undefined => {
     // (THE deleted-file bug, confirmed in git's getResources: a deletion has modified===undefined and opens
     // as a git: single editor — the old file:-scheme-only check skipped it, so the badge never matched.)
     if (input instanceof vscode.TabInputText) {
+        const resolved = toFilePathUri(input.uri);
+        if (resolved && isChangeFileUri(resolved)) {
+            return resolved;
+        }
+    }
+    // A BINARY / IMAGE change opens as a custom editor (TabInputCustom) — git.openChange renders it via a
+    // custom editor, NOT a text diff/editor (Codex review 2026-07-04, follow-up to the smart-mouse BUG 2).
+    // Without this branch the shared "which file is under review?" predicate missed binary/image review tabs,
+    // so repo selection (getFileChanges) and the late-worktree-collapse protection could pick the wrong repo
+    // or yank you off a binary/image diff. Resolve the custom tab's on-disk uri and accept it only when it's an
+    // ACTUAL change, using the SAME toFilePathUri + isChangeFileUri predicates the smart-mouse gate uses.
+    if (input instanceof vscode.TabInputCustom) {
         const resolved = toFilePathUri(input.uri);
         if (resolved && isChangeFileUri(resolved)) {
             return resolved;
@@ -942,16 +1006,30 @@ const getUnstagedUris = (repo: any, isTreeView: boolean): vscode.Uri[] => {
 };
 
 const getFileChanges = async (): Promise<FileChange[]> => {
-    const gitExtension = vscode.extensions.getExtension<any>("vscode.git")!.exports;
-    const git = gitExtension.getAPI(1);
+    // BUG 10 FIX (v1.2.9 — getFileChanges threw instead of no-oping when git wasn't ready / no repos):
+    // the old code did `getExtension("vscode.git")!.exports` (`.exports` is undefined until the git extension
+    // ACTIVATES, so `.getAPI(1)` threw TypeError) and then `git.repositories[0]` + unguarded `activeRepo.state`
+    // (undefined when repositories is [] — fresh window still scanning, or a non-git workspace). The command
+    // promise rejected, so a nav/reveal keypress did nothing AND no fallback ran (openFirst/openLast threw
+    // before reaching their length===0 guard). Now we use the SAME guarded `?.exports?.getAPI(1)` form as
+    // every other git-touching helper in this file and return [] on any miss so every caller no-ops cleanly.
+    const git = vscode.extensions.getExtension<any>("vscode.git")?.exports?.getAPI(1);
+    if (!git) {
+        return []; // git extension not present / not activated yet -> no changes, callers no-op gracefully
+    }
     const workspaceUri = vscode.workspace.workspaceFolders?.map((ws) => ws.uri)[0];
     // Prefer the repo that owns the file CURRENTLY BEING REVIEWED (tab-derived, focus-independent) so a
     // multi-root workspace navigates within the right repo — falling through from a file in repo B used to
     // build repo A's list, miss the file (findCurrentIndex -1) and silently stop (Codex review, v1.2.1).
-    // Fall back to the first workspace folder's repo / first known repo, as before.
+    // Fall back to the first workspace folder's repo, then the shared getPrimaryRepository() (the same
+    // "pick the primary repo" predicate the worktree-collapse uses) instead of a raw git.repositories[0]
+    // that could be undefined. Null-check the result so a still-scanning window returns [] rather than throws.
     const reviewUri = currentReviewFileUri();
     const activeRepo =
-        (reviewUri && git.getRepository(reviewUri)) || git.getRepository(workspaceUri?.path) || git.repositories[0];
+        (reviewUri && git.getRepository(reviewUri)) || git.getRepository(workspaceUri?.path) || getPrimaryRepository();
+    if (!activeRepo) {
+        return []; // no repositories populated yet / non-git workspace -> no changes, callers no-op gracefully
+    }
     const isTreeView = vscode.workspace.getConfiguration("better-git-vscode").get("treeView");
 
     // Keep the git status alongside the uri for staged entries: openChangeEntry needs it to choose which
@@ -1008,11 +1086,10 @@ const getActiveChange = async (): Promise<ActiveChange | null> => {
     if (input instanceof vscode.TabInputTextDiff) {
         return { path: input.modified.path, staged: input.modified.scheme === "git" };
     }
-    // 3-way merge editor (conflict). Duck-typed (TabInputTextMerge isn't in @types/vscode 1.83); `result` is
-    // the working-tree file. Treat as the unstaged side for matching.
-    const mergeInput = input as any;
-    if (mergeInput && mergeInput.result && mergeInput.input1 && mergeInput.input2) {
-        return { path: mergeInput.result.path as string, staged: false };
+    // 3-way merge editor (conflict) — recognised via the shared isMergeEditorInput predicate. `result` is the
+    // working-tree file. Treat as the unstaged side for matching (a conflict is never a "staged" view here).
+    if (isMergeEditorInput(input)) {
+        return { path: (input as any).result.path as string, staged: false };
     }
 
     // PLAIN single-editor tab (v1.2.1 fix): resolve the path from the TAB itself, focus-independently.
@@ -1025,11 +1102,24 @@ const getActiveChange = async (): Promise<ActiveChange | null> => {
     if (input instanceof vscode.TabInputText) {
         const resolved = toFilePathUri(input.uri);
         if (resolved) {
-            return { path: resolved.path, staged: null };
+            // BUG 9 FIX (v1.2.9 — dual-state DELETED file dead-ended navigation): return staged=FALSE here, not
+            // staged=null. Rationale: EVERY staged/index side in this extension opens as a side-by-side
+            // TabInputTextDiff (openChangeEntry always uses vscode.diff for the staged branch), so a PLAIN
+            // single-editor active view is ALWAYS the working-tree/unstaged representation — an untracked file
+            // (file: editor) or a deleted file's HEAD-blob (git: editor). Labelling it staged=null forced
+            // findCurrentIndex down its path-only branch, where the AMBIGUITY GUARD (path appears in BOTH the
+            // staged + unstaged groups) permanently returned -1 for a dual-state deleted/untracked file — and a
+            // deleted file NEVER opens as a readable diff, so the side stayed null forever and next/previous
+            // nav was hard-stuck with no recovery. With staged=false, findCurrentIndex's exact {path, staged}
+            // match resolves the file to its unstaged entry and the guard never fires. Safe for single-state
+            // files too: a staged-only file shown as a plain editor fails the exact staged=false match but the
+            // path appears once, so the guard doesn't fire and the path-only fallback still finds it.
+            return { path: resolved.path, staged: false };
         }
     }
 
-    // Fallback for non-textual files (images etc.): path only, side unknown.
+    // Fallback for genuinely non-textual files (images etc.): path only, side unknown. This is now the ONLY
+    // path that yields staged=null, so the findCurrentIndex ambiguity guard below only ever gates images.
     const path = await getActiveFilePath();
     return path ? { path, staged: null } : null;
 };
@@ -1112,15 +1202,16 @@ const openChangeEntry = async (entry: FileChange): Promise<void> => {
         // SILENT-NO-OP GUARD (Codex review, v1.2.1): with git.untrackedChanges="separate", untracked files
         // live in the separate untracked group and git.openChange(uri) resolves nothing for them — and it
         // does NOT throw, so the catch above never fires and navigation would just... stay put. Verify the
-        // active tab actually shows the requested file now; if not, open it directly. (uriFilePathOfTab
-        // logic: reuse currentReviewFileUri-style tab reading via activeTab input.)
-        const shownInput: unknown = vscode.window.tabGroups.activeTabGroup.activeTab?.input;
-        const shownUri =
-            shownInput instanceof vscode.TabInputTextDiff
-                ? toFilePathUri(shownInput.modified) ?? toFilePathUri(shownInput.original)
-                : shownInput instanceof vscode.TabInputText
-                    ? toFilePathUri(shownInput.uri)
-                    : undefined;
+        // active tab actually shows the requested file now; if not, open it directly.
+        // CODEX FIX 2026-07-04 (High): resolve the shown file via the SHARED currentReviewFileUri() predicate,
+        // NOT a local diff/plain-text-only copy. git.openChange legitimately opens a merge conflict as a 3-way
+        // merge editor and a binary/image change as a custom editor — neither is a TabInputTextDiff/TabInputText,
+        // so the old local check saw "no match" and fell back to showTextDocument(entry.uri), which REPLACED the
+        // correct merge/binary view with the raw file (defeating the very merge/binary handling this batch added).
+        // currentReviewFileUri now recognises diff + plain + merge + custom (binary/image) tabs, so the fallback
+        // fires ONLY when the target genuinely didn't open. The common modified-diff path is unchanged (its
+        // TabInputTextDiff branch returns the modified-side path exactly as the old local copy did).
+        const shownUri = currentReviewFileUri();
         if (!shownUri || shownUri.path.toLowerCase() !== entry.uri.path.toLowerCase()) {
             try {
                 await vscode.window.showTextDocument(entry.uri, { preview: true });
@@ -1279,6 +1370,52 @@ const openPreviousFile = async () => {
         await vscode.commands.executeCommand("workbench.action.closeActiveEditor");
     }
     await openChangeEntry(fileChanges[prevIndex]);
+
+    // BUG 5 FIX (v1.2.9 — backward rollover into a NEW file landed at its TOP and then skipped the whole file):
+    // when navigating BACKWARD, a MODIFIED file lands at its LAST hunk (bottom) via compareEditor.previousChange,
+    // so subsequent 'previous' presses step UP through it. But that command is a NO-OP on a genuinely-NEW file's
+    // PLAIN editor (no diff hunks to step to), leaving the caret at line 0 (top). The next 'previous' press then
+    // sees stepThroughNewFile('up') with cur<=0 (top edge), returns false, and jumps to the file BEFORE it — so
+    // the entire new file's content is skipped unseen (only its first screenful was ever visible via backward
+    // nav). Fix: for a genuinely-new target (isFullyAddedFile — the SAME shared predicate newFileScrollEditor
+    // uses), pin the caret at the file's LAST line (bottom) — mirroring how a modified file lands at its last
+    // hunk — so the following 'previous' press's stepThroughNewFile('up') is NOT at the top edge and steps up
+    // through the whole file. IMPORTANT: only do the (retried) new-file landing when the TARGET is actually a
+    // new file; a modified/deleted target takes the immediate compareEditor.previousChange path with NO delay
+    // (the retry loop must never add latency to the common backward-diff rollover).
+    // CODEX FIX 2026-07-04 (Medium): additionally require the target to be UNSTAGED (!staged). isFullyAddedFile
+    // returns true for a STAGED-new file (INDEX_ADDED) too, but openChangeEntry opens a staged entry as a
+    // side-by-side DIFF, not a plain new-file editor — so newFileScrollEditor() below would never resolve, we'd
+    // burn the 8×30ms retry loop for nothing, then `return` and SKIP the compareEditor.previousChange landing,
+    // reintroducing exactly the "land at top then previous skips the file" bug for staged-new diffs. Gating on
+    // !staged restricts this new-file landing to the plain-editor case (untracked / unstaged-new); a staged-new
+    // target correctly falls through to the compareEditor.previousChange path below.
+    if (!fileChanges[prevIndex].staged && isFullyAddedFile(fileChanges[prevIndex].uri)) {
+        // The plain editor may not register in visibleTextEditors synchronously after openChangeEntry, so retry
+        // the gate for a few short ticks. Reuses newFileScrollEditor() (plain file: tab + genuinely-new status +
+        // visible editor) — the exact gate goToPreviousDiff's own new-file stepping uses.
+        let newFileEditor: vscode.TextEditor | undefined;
+        for (let i = 0; i < 8 && !newFileEditor; i++) {
+            newFileEditor = newFileScrollEditor();
+            if (!newFileEditor) {
+                await new Promise((r) => setTimeout(r, 30)); // wait one short tick for the editor to become visible
+            }
+        }
+        if (newFileEditor) {
+            // Land the caret at the LAST line so the next 'previous' steps UP through the new file (mirrors how a
+            // modified file lands at its last hunk on backward rollover). Same selection+reveal pattern as
+            // stepThroughNewFile so behaviour is consistent with in-file new-file stepping.
+            const lastLine = Math.max(0, newFileEditor.document.lineCount - 1);
+            const pos = new vscode.Position(lastLine, 0);
+            newFileEditor.selection = new vscode.Selection(pos, pos);
+            newFileEditor.revealRange(new vscode.Range(lastLine, 0, lastLine, 0), vscode.TextEditorRevealType.InCenter);
+        }
+        // If the editor never resolved (rare race), leave it at the top — same no-op the old unconditional
+        // compareEditor.previousChange produced on a plain new-file editor, so no regression.
+        return;
+    }
+    // Diff (modified/renamed) file, or any non-new-file view: land at the LAST hunk exactly as before so
+    // subsequent 'previous' presses step up through the diff. No delay on this common path.
     await vscode.commands.executeCommand("workbench.action.compareEditor.previousChange");
 };
 
@@ -1529,12 +1666,75 @@ const hunkStagingConfig = (visLines: number) => {
 // (advance the counter); '-' removed lines exist only on the OLD side (don't advance, don't break a run —
 // in a replacement all '-' come before the '+' block, so the '+' lines stay contiguous). Each maximal run
 // of '+' lines becomes one ModifiedHunk. Line numbers therefore match the editor's modified document:
-//   • unstaged side  -> modified doc is the on-disk working file; diffWithHEAD's +lines are working lines.
+//   • unstaged side  -> modified doc is the on-disk working file; the working-vs-INDEX diff's +lines are
+//                       working lines. This is the SAME diff git.openChange DISPLAYS for the unstaged side.
 //   • staged  side   -> modified doc is the git: index blob; diffIndexWithHEAD's +lines are index lines.
-// (diffWithHEAD is working-tree-vs-HEAD; for a PARTIALLY-staged file that differs slightly from VS Code's
-// working-tree-vs-index "Changes" view, but the +line NUMBERS still address the same working document, so
-// tall-hunk detection stays correct. Fully-unstaged files — the common case — match exactly.) Any failure
-// (git API not ready, method missing, unreadable diff) returns [] so callers defer to plain navigation.
+//
+// BUG 6 FIX (v1.2.9): the unstaged side previously parsed repo.diffWithHEAD (working-tree-vs-HEAD), but the
+// editor shows working-tree-vs-INDEX. For a PARTIALLY-staged file those diffs DIFFER: regions already staged
+// appear as '+' hunks in HEAD-vs-working but are NOT change regions in the shown index-vs-working editor. The
+// old comment claimed "tall-hunk detection stays correct" — WRONG: the +line NUMBERS share the working-doc
+// coordinate space, but the SET and EXTENT of hunks differ, and stepping depends on exactly those. So the
+// caret could sit inside a "phantom" tall hunk over content that looks unchanged in the shown diff, or two
+// adjacent staged+unstaged edits could merge into one over-long run, over-estimating height. Fully-unstaged
+// files (index==HEAD) were unaffected; only partially-staged files broke. Fix: parse the SAME working-vs-index
+// diff the editor displays. The vscode.git API has no per-PATH working-vs-index string method (diff(cached=false)
+// returns the WHOLE-repo `git diff`), so we fetch the full diff once and extract just this file's section
+// (extractFileDiffSection) before feeding it to the unchanged parser — routing only the SOURCE, not forking
+// the parser. Any failure (git API not ready, method missing, unreadable diff, file not in the diff) returns
+// [] so callers defer to plain navigation.
+
+// Extract the single-file section for `fileUri` out of a multi-file unified diff (as produced by git diff of
+// the whole repo). A unified diff is a concatenation of per-file sections, each starting with a
+// `diff --git a/<rel> b/<rel>` header. We locate the section whose modified-side header line (`+++ b/<rel>`)
+// matches this file's repo-relative path and return just that section's text; the existing @@-parser then
+// sees exactly one file's hunks. Returns "" when the file isn't present (e.g. it's fully staged so it has no
+// working-vs-index changes), which makes getModifiedSideHunks return [] and defer to plain navigation.
+const extractFileDiffSection = (fullDiff: string, fileUri: vscode.Uri, repo: any): string => {
+    if (!fullDiff) {
+        return "";
+    }
+    // Repo-relative, forward-slashed, lowercased path — how it appears (case-insensitively) after `+++ b/`.
+    const rootPath: string | undefined = repo?.rootUri?.fsPath;
+    let rel = fileUri.fsPath;
+    if (rootPath && rel.toLowerCase().startsWith(rootPath.toLowerCase())) {
+        rel = rel.slice(rootPath.length);
+    }
+    rel = rel.replace(/^[\/\\]+/, "").replace(/\\/g, "/").toLowerCase();
+    const lines = fullDiff.split("\n");
+    // Walk sections: a new section begins at each "diff --git" line. Collect the current section; when we hit
+    // the next header (or end), decide whether the section we just closed is the one we want (its `+++ b/<rel>`
+    // — or, for a deletion, `--- a/<rel>` — matches). Return the first matching section.
+    let current: string[] = [];
+    let matched: string[] | undefined;
+    const targetMarkers = [`+++ b/${rel}`, `--- a/${rel}`];
+    const closeSection = () => {
+        if (current.length === 0) {
+            return;
+        }
+        const isMatch = current.some((l) => {
+            const low = l.toLowerCase();
+            return targetMarkers.some((m) => low === m);
+        });
+        if (isMatch && !matched) {
+            matched = current;
+        }
+        current = [];
+    };
+    for (const line of lines) {
+        if (line.startsWith("diff --git ")) {
+            closeSection(); // finish the previous section before starting a new one
+            current = [line];
+            continue;
+        }
+        if (current.length > 0) {
+            current.push(line);
+        }
+    }
+    closeSection(); // flush the final section
+    return matched ? matched.join("\n") : "";
+};
+
 const getModifiedSideHunks = async (fileUri: vscode.Uri, staged: boolean): Promise<ModifiedHunk[]> => {
     try {
         const git = vscode.extensions.getExtension<any>("vscode.git")?.exports?.getAPI(1);
@@ -1542,11 +1742,18 @@ const getModifiedSideHunks = async (fileUri: vscode.Uri, staged: boolean): Promi
         if (!repo) {
             return []; // no owning repo (or git not ready) -> defer to built-in navigation
         }
-        // Ask git for THIS file's unified diff on the correct side. Both are overloads that take a path and
-        // return the raw unified-diff string (vscode.git Repository API).
-        const diffText: string = staged
-            ? await repo.diffIndexWithHEAD(fileUri.fsPath) // staged diff (index vs HEAD)
-            : await repo.diffWithHEAD(fileUri.fsPath); // unstaged diff (working tree vs HEAD)
+        // Ask git for THIS file's unified diff on the correct side (BUG 6 FIX — see the big comment above):
+        //   • staged   -> diffIndexWithHEAD(path): index-vs-HEAD, matching the shown staged diff. Per-path.
+        //   • unstaged -> working-tree-vs-INDEX, matching the shown unstaged diff. The API has no per-path
+        //                 form (diff(cached=false) is whole-repo), so we get the full diff and extract this
+        //                 file's section — parsing HEAD-vs-working here would mis-detect partially-staged files.
+        let diffText: string;
+        if (staged) {
+            diffText = await repo.diffIndexWithHEAD(fileUri.fsPath); // staged diff (index vs HEAD)
+        } else {
+            const fullWorkingVsIndex: string = await repo.diff(false); // `git diff` — working tree vs index, whole repo
+            diffText = extractFileDiffSection(fullWorkingVsIndex, fileUri, repo); // just this file's section
+        }
         if (!diffText) {
             return [];
         }
@@ -1685,18 +1892,32 @@ const stepTallHunk = async (ctx: HunkStageContext, direction: "down" | "up"): Pr
     if (!hunk) {
         return false; // caret isn't inside a hunk (between changes / moved away) -> plain navigation
     }
-    const { threshold, step, overlap } = hunkStagingConfig(visLines);
+    const { threshold, step } = hunkStagingConfig(visLines); // overlap only feeds `step` now (BUG 8 removed TINY_TAIL)
     const span = hunk.end - hunk.start + 1;
     if (span <= threshold) {
         return false; // hunk fits on one screen (or under the override threshold) -> behave EXACTLY as today
     }
-    // If only a tiny tail of the hunk is beyond the current viewport edge, don't do a pointless 2-line final
-    // step — treat the far edge as "reached" and let the caller advance to the next/prev hunk instead.
-    const TINY_TAIL = Math.max(2, overlap);
+    // BUG 8 FIX (v1.2.9): advance only when the far edge is FULLY on screen (remaining <= 0), not when a
+    // "tiny tail" of up to overlap(=4) CHANGED lines is still off screen. The old guard `remaining <= TINY_TAIL`
+    // (TINY_TAIL = max(2, overlap), default 4) skipped the last up-to-4 changed lines of a tall hunk unseen
+    // before advancing — silently hiding genuine changes in exactly the review flow this tool exists for.
+    // Stepping to the exact edge instead reuses the SAME reveal + clamp path below (Math.min/Math.max already
+    // land precisely at hunk.end-visLines+1 / hunk.start, never over-scrolling into unchanged code), so no
+    // divergent branch is added. Loop-safe: after the final step `remaining` becomes 0, so the NEXT press
+    // cleanly advances to the next/prev hunk. This ALSO fixes BUG 7 (the up-direction mid-hunk "bounce"):
+    // previously a barely-tall hunk (1..4 lines taller than the viewport) hit `remainingAbove <= TINY_TAIL`
+    // on the first 'previous' press after landing and fell straight through to compareEditor.previousChange
+    // with the caret pinned MID-hunk (top of viewport = hunk.end-visLines+1). previousChange from inside a
+    // change region lands on that SAME hunk's start (above the mid-hunk caret), which the lineAfter<lineBefore
+    // check misreads as an advance, re-landing the same hunk — a bounce that never reached the previous hunk.
+    // With `remainingAbove <= 0`, that first press now does a real step UP to hunk.start (the change-region
+    // boundary), so the following press's compareEditor.previousChange starts from the boundary and correctly
+    // reaches the PREVIOUS hunk. (Down never bounced: nextChange from a mid-hunk caret looks forward/below the
+    // caret and finds the NEXT hunk, so no equivalent fix is needed there.)
     if (direction === "down") {
         const remainingBelow = hunk.end - bottom; // lines of the hunk still below the viewport
-        if (remainingBelow <= TINY_TAIL) {
-            return false; // bottom of the hunk is on screen (or all-but-a-sliver) -> advance to next hunk
+        if (remainingBelow <= 0) {
+            return false; // bottom of the hunk is fully on screen -> advance to next hunk
         }
         // Scroll down ~one screenful (minus overlap), but never past the point where the hunk's last line
         // sits at the bottom of the viewport (no scrolling into unchanged code below the hunk).
@@ -1708,8 +1929,8 @@ const stepTallHunk = async (ctx: HunkStageContext, direction: "down" | "up"): Pr
         return true;
     } else {
         const remainingAbove = top - hunk.start; // lines of the hunk still above the viewport
-        if (remainingAbove <= TINY_TAIL) {
-            return false; // top of the hunk is on screen -> advance to previous hunk
+        if (remainingAbove <= 0) {
+            return false; // top of the hunk is fully on screen -> advance to previous hunk
         }
         let newTop = Math.max(top - step, hunk.start);
         if (newTop >= top) {
@@ -1749,8 +1970,10 @@ const revealHunkOnLanding = (ctx: HunkStageContext, caretLine: number, direction
 
 const goToNextDiff = async () => {
     var activeEditor = vscode.window.activeTextEditor;
-    const currentFilename = await getActiveFilePath();
-    if (!activeEditor && !currentFilename) {
+    // BUG 13 (v1.2.9): tab-first "is anything under review?" check via activeNavFilePath — avoids the clipboard
+    // save/blank/restore hack in the hot path when focus is in the SCM panel. activeEditor is still kept for
+    // the navEditor fallback below.
+    if (!(await activeNavFilePath())) {
         await openFirstFile();
         return;
     }
@@ -1809,8 +2032,8 @@ const goToNextDiff = async () => {
 
 const goToPreviousDiff = async () => {
     var activeEditor = vscode.window.activeTextEditor;
-    const currentFilename = await getActiveFilePath();
-    if (!activeEditor && !currentFilename) {
+    // BUG 13 (v1.2.9): tab-first "is anything under review?" check via activeNavFilePath (see goToNextDiff).
+    if (!(await activeNavFilePath())) {
         await openLastFile();
         return;
     }
@@ -1857,8 +2080,8 @@ const goToPreviousDiff = async () => {
 };
 
 const goToFirstOrNextFile = async () => {
-    const currentFilename = await getActiveFilePath();
-    if (!currentFilename) {
+    // BUG 13 (v1.2.9): tab-first "is anything under review?" check via activeNavFilePath (see goToNextDiff).
+    if (!(await activeNavFilePath())) {
         await openFirstFile();
         return;
     }
@@ -1867,8 +2090,8 @@ const goToFirstOrNextFile = async () => {
 };
 
 const goToLastOrPreviousFile = async () => {
-    const currentFilename = await getActiveFilePath();
-    if (!currentFilename) {
+    // BUG 13 (v1.2.9): tab-first "is anything under review?" check via activeNavFilePath (see goToNextDiff).
+    if (!(await activeNavFilePath())) {
         await openLastFile();
         return;
     }
@@ -1926,42 +2149,50 @@ const stageCurrentFileAndAdvance = async (direction: "next" | "previous") => {
     const currentNormalized = currentUri.path.slice(1).replace(/\\/g, "/").toLowerCase();
     const pathMatches = (uri: vscode.Uri) => uri.path.toLowerCase().endsWith(currentNormalized);
 
-    // SAFETY GUARD: only act if the active file is actually a change (staged, unstaged, or untracked).
-    // Without this, an accidental stage-and-advance shortcut while editing a clean/unrelated file would run
-    // git add as a no-op and then close that editor — a nasty surprise. Untracked is included so staging a brand-new
-    // file still works; navigation below stays within tracked unstaged files (see note).
-    const untrackedChanges = activeRepo.state.untrackedChanges ?? [];
-    const isChangedFile =
-        activeRepo.state.indexChanges.some((file: any) => pathMatches(file.uri)) ||
-        activeRepo.state.workingTreeChanges.some((file: any) => pathMatches(file.uri)) ||
-        untrackedChanges.some((file: any) => pathMatches(file.uri));
-    if (!isChangedFile) {
+    // BUG 4 FIX (v1.2.9 — stage-and-advance was a silent no-op on a merge-conflict file, and skipped conflicts
+    // as advance targets). Route BOTH the safety guard AND the advance-target list through the ONE shared list
+    // builder getFileChanges() — the SAME list next/previous-scm-change navigation uses — so the stage-and-
+    // advance family can reach + progress through EXACTLY the entries the nav family can. Previously the guard
+    // checked only index/working/untracked (NEVER state.mergeChanges), so a pure merge-conflict file failed the
+    // guard and this function returned as a silent no-op (no stage, no advance, no message), stranding the user
+    // on the conflict; and the advance list (getUnstagedUris) also omitted merges, so advancing from a normal
+    // file skipped over conflicts — an asymmetry with keyboard nav, which walks through them. getFileChanges
+    // includes merge conflicts (as staged:false entries) in the correct SCM order, so deriving both from it
+    // fixes both parts with no divergent merge-only branch. Read it BEFORE staging: getFileChanges snapshots
+    // activeRepo.state at call time, so the target is computed against the pre-stage state (deterministic).
+    const allChanges = await getFileChanges();
+
+    // SAFETY GUARD: only act if the active file is actually a change (staged, unstaged, untracked, OR a merge
+    // conflict). Without this, an accidental stage-and-advance while editing a clean/unrelated file would run
+    // git add as a no-op then close that editor — a nasty surprise. Testing membership against getFileChanges()
+    // keeps this guard and the advance list below reading from the SAME set, so they can never diverge again.
+    if (!allChanges.some((c) => pathMatches(c.uri))) {
         return;
     }
 
-    // Work out the next unstaged file BEFORE staging. activeRepo.state updates asynchronously after a
-    // stage, so reading the list afterwards would see a stale snapshot (current file still present) or
-    // shifted indices. Capturing the target up-front makes where-we-land deterministic. The unstaged list
-    // now INCLUDES untracked/new files (see getUnstagedUris) so stage-and-advance lands on a brand-new file
-    // too — git.openChange opens them as a diff vs an empty original, so they're navigable like any other.
-    const isTreeView = vscode.workspace.getConfiguration("better-git-vscode").get("treeView");
-    const workingTreeChanges = getUnstagedUris(activeRepo, !!isTreeView);
+    // The advance targets are the NON-STAGED entries (tracked unstaged + untracked/new + merge conflicts) in
+    // SCM nav order. Staged entries are excluded because there's nothing to stage-and-advance FROM on them (the
+    // staged-side early-return above already handled that case). Untracked/new files ARE included (git.openChange
+    // opens them as a diff vs an empty original), so stage-and-advance lands on a brand-new file too.
+    const advanceTargets = allChanges.filter((c) => !c.staged).map((c) => c.uri);
 
-    const currentIndex = workingTreeChanges.findIndex(pathMatches);
+    const currentIndex = advanceTargets.findIndex(pathMatches);
     // Where to land after staging, by direction:
     //   "next"     -> the file AFTER the current one (top-to-bottom review); if it was the LAST, fall back to
     //                 the PREVIOUS one so we don't strand you. Not in the list -> the FIRST unstaged file.
     //   "previous" -> the file BEFORE the current one (bottom-to-top review); if it was the FIRST, fall back
     //                 to the NEXT one. Not in the list -> the LAST unstaged file.
     // The ?? handles the boundary; for the only-file case the fallback index is out of range and returns
-    // undefined (-> close the editor below, nothing left to review).
+    // undefined (-> close the editor below, nothing left to review). NOTE: this end-of-list guard is exactly
+    // what the mouse (F18/F19) + the "+" button inherit for free — they call this SAME function, so the
+    // at-the-end/at-the-bottom behavior is identical no matter how stage-and-advance is triggered.
     let targetUnstagedFile: vscode.Uri | undefined;
     if (currentIndex === -1) {
-        targetUnstagedFile = direction === "next" ? workingTreeChanges[0] : workingTreeChanges[workingTreeChanges.length - 1];
+        targetUnstagedFile = direction === "next" ? advanceTargets[0] : advanceTargets[advanceTargets.length - 1];
     } else if (direction === "next") {
-        targetUnstagedFile = workingTreeChanges[currentIndex + 1] ?? workingTreeChanges[currentIndex - 1];
+        targetUnstagedFile = advanceTargets[currentIndex + 1] ?? advanceTargets[currentIndex - 1];
     } else {
-        targetUnstagedFile = workingTreeChanges[currentIndex - 1] ?? workingTreeChanges[currentIndex + 1];
+        targetUnstagedFile = advanceTargets[currentIndex - 1] ?? advanceTargets[currentIndex + 1];
     }
 
     // Stage the whole current file — equivalent to clicking the + next to it in the Source Control view.
@@ -1983,36 +2214,75 @@ const stageCurrentFileAndAdvance = async (direction: "next" | "previous") => {
     if (!isPreview) {
         await vscode.commands.executeCommand("workbench.action.closeActiveEditor");
     }
-    await vscode.commands.executeCommand("git.openChange", targetUnstagedFile);
+    // BUG 11 FIX (v1.2.9 — stage-and-advance landed nowhere on an untracked target with
+    // git.untrackedChanges="separate"): route the final open through the SHARED openChangeEntry (the same
+    // function nav's openNextFile/openPreviousFile use) instead of a raw git.openChange. In "separate" mode
+    // git.openChange(untrackedUri) resolves nothing AND does NOT throw, so after closing the current editor
+    // the target never opened and the user was stranded on a blank/closed editor. openChangeEntry's unstaged
+    // path has a shown-tab verification + showTextDocument fallback that handles exactly this silent-no-op —
+    // so the mouse/keyboard/"+" stage-and-advance now inherits it for free, matching plain navigation.
+    await openChangeEntry({ uri: targetUnstagedFile, staged: false });
 };
 
+// BUG 13 FIX (v1.2.9): serialize getActiveFilePath so its clipboard save/blank/restore dance can't interleave.
+// The clipboard hack (below) is inherently racy: two concurrent calls (Ethan mashing alt+.) could have call B
+// read the ALREADY-BLANKED clipboard as its "original" and later restore "" — permanently losing his real
+// clipboard. A single in-flight promise makes concurrent callers share ONE dance instead of overlapping.
+let getActiveFilePathInFlight: Promise<string> | undefined;
 const getActiveFilePath = async (): Promise<string> => {
-    var activeEditor = vscode.window.activeTextEditor;
-    const currentFilename = activeEditor?.document.uri.path;
-    if (currentFilename) {
-        return currentFilename;
+    if (getActiveFilePathInFlight) {
+        return getActiveFilePathInFlight; // a dance is already running — reuse it rather than starting a racing one
     }
+    getActiveFilePathInFlight = (async (): Promise<string> => {
+        var activeEditor = vscode.window.activeTextEditor;
+        const currentFilename = activeEditor?.document.uri.path;
+        if (currentFilename) {
+            return currentFilename;
+        }
 
-    // Since there is no API to get details of non-textual files, the following workaround is performed:
-    // 1. Saving the original clipboard data to a local variable.
-    const originalClipboardData = await vscode.env.clipboard.readText();
+        // Since there is no API to get details of non-textual files, the following workaround is performed:
+        // 1. Saving the original clipboard data to a local variable.
+        const originalClipboardData = await vscode.env.clipboard.readText();
 
-    // 2. Populating the clipboard with an empty string
-    await vscode.env.clipboard.writeText("");
+        // 2. Populating the clipboard with an empty string
+        await vscode.env.clipboard.writeText("");
 
-    // 3. Calling the copyPathOfActiveFile that populates the clipboard with the source path of the active file.
-    // If there is no active file - the clipboard will not be populated and it will stay with the empty string.
-    await vscode.commands.executeCommand("workbench.action.files.copyPathOfActiveFile");
+        // 3. Calling the copyPathOfActiveFile that populates the clipboard with the source path of the active file.
+        // If there is no active file - the clipboard will not be populated and it will stay with the empty string.
+        await vscode.commands.executeCommand("workbench.action.files.copyPathOfActiveFile");
 
-    // 4. Get the clipboard data after the API call
-    const postAPICallClipboardData = await vscode.env.clipboard.readText();
+        // 4. Get the clipboard data after the API call
+        const postAPICallClipboardData = await vscode.env.clipboard.readText();
 
-    // 5. Return the saved original clipboard data to the clipboard so this method
-    // will not interfere with the clipboard's content.
-    await vscode.env.clipboard.writeText(originalClipboardData);
+        // 5. Return the saved original clipboard data to the clipboard so this method
+        // will not interfere with the clipboard's content.
+        await vscode.env.clipboard.writeText(originalClipboardData);
 
-    // 6. Return the clipboard data from the API call (which could be an empty string if it failed).
-    return postAPICallClipboardData;
+        // 6. Return the clipboard data from the API call (which could be an empty string if it failed).
+        return postAPICallClipboardData;
+    })();
+    try {
+        return await getActiveFilePathInFlight;
+    } finally {
+        getActiveFilePathInFlight = undefined; // clear so the NEXT (non-overlapping) press runs a fresh lookup
+    }
+};
+
+// BUG 13 FIX (v1.2.9): the four navigation entry-guards used to call getActiveFilePath() just to ask "is there
+// a file under review?" — but when focus was in the SCM panel (activeTextEditor undefined, common in Ethan's
+// flow) that fired the clipboard save/blank/restore hack on EVERY press, transiently blanking his clipboard.
+// This resolves the active file focus-INDEPENDENTLY from the active TAB first (currentReviewFileUri — the same
+// shared "which file is under review" predicate the nav + badge use), then the focused editor's uri, and only
+// falls back to the clipboard-based getActiveFilePath for genuinely non-textual active files (images — which
+// have neither a diff-tab input nor a text editor). So the common review path never touches the clipboard.
+// Returns undefined only when there is truly nothing open to act on.
+const activeNavFilePath = async (): Promise<string | undefined> => {
+    const fromTab = currentReviewFileUri() ?? vscode.window.activeTextEditor?.document.uri;
+    if (fromTab) {
+        return fromTab.path;
+    }
+    const fallback = await getActiveFilePath(); // last-ditch, non-textual (image) case only
+    return fallback || undefined;
 };
 
 // Returns the on-disk file:// Uri of the active editor. A staged diff's modified side uses the `git`
@@ -2118,7 +2388,39 @@ async function smartNavigate(direction: "forward" | "back") {
             const resolved = toFilePathUri(input.uri); // git: uri -> on-disk file: path (path lives in the query)
             isDeletedFileView = resolved ? isChangeFileUri(resolved) : false;
         }
-        inReview = isDiff || isNewFileView || isDeletedFileView;
+        //   4. MERGE-CONFLICT file  -> a 3-way TabInputTextMerge editor (BUG 1, 2026-07-04). The keyboard
+        //      next/previous-scm-change handle conflicts (getFileChanges includes state.mergeChanges,
+        //      getActiveChange + currentReviewFileUri duck-type the merge editor), so the mouse must too — else
+        //      it silently does browser back/forward on a conflict while the keyboard navigates the changeset.
+        //      Detected via the SAME shared isMergeEditorInput predicate currentReviewFileUri/getActiveChange use.
+        const isMergeView = !isDiff && !isNewFileView && !isDeletedFileView && isMergeEditorInput(input);
+        //   5. BINARY / IMAGE change  -> a TabInputCustom (custom editor) tab (BUG 2, 2026-07-04). git.openChange
+        //      shows an image/binary diff as a custom editor, not TabInputTextDiff/TabInputText, so none of the
+        //      cases above match and the mouse fell through to browser nav — strictly weaker than the keyboard
+        //      (getActiveChange can still resolve the path for it). Resolve the custom tab's on-disk uri and
+        //      require it to be an ACTUAL change (toFilePathUri + isChangeFileUri — the SAME shared predicates)
+        //      so we only treat a real binary CHANGE view as review, never an arbitrary custom-editor tab.
+        let isBinaryChangeView = false;
+        if (!isDiff && !isNewFileView && !isDeletedFileView && !isMergeView && input instanceof vscode.TabInputCustom) {
+            const resolved = toFilePathUri(input.uri);
+            isBinaryChangeView = resolved ? isChangeFileUri(resolved) : false;
+        }
+        //   6. PLAIN MERGE-CONFLICT file (Codex review 2026-07-04, plain-merge follow-up). Case 4 only catches the
+        //      3-way TabInputTextMerge editor, which VS Code opens only when git.mergeEditor=true. With the DEFAULT
+        //      git.mergeEditor=false a conflict opens as the PLAIN working file (file: scheme TabInputText) with
+        //      conflict markers — so the mouse fell through to browser nav while the keyboard navigated it
+        //      (getFileChanges includes mergeChanges). Match a plain file: editor whose path is SPECIFICALLY in
+        //      mergeChanges (isMergeConflictFileUri, NOT the general isChangeFileUri) so an ordinary modified file
+        //      opened in a plain editor is still deliberately excluded from mouse change-nav (same intent as case 3).
+        let isPlainMergeFileView = false;
+        if (
+            !isDiff && !isNewFileView && !isDeletedFileView && !isMergeView && !isBinaryChangeView &&
+            input instanceof vscode.TabInputText && input.uri.scheme === "file"
+        ) {
+            const resolved = toFilePathUri(input.uri);
+            isPlainMergeFileView = resolved ? isMergeConflictFileUri(resolved) : false;
+        }
+        inReview = isDiff || isNewFileView || isDeletedFileView || isMergeView || isBinaryChangeView || isPlainMergeFileView;
     } catch {
         // Defensive fallback: on a very old host where TabInputTextDiff doesn't exist (or newFileScrollEditor
         // throws) the lines above could throw. Fall back to the legacy heuristic — treat it as review only if
@@ -2129,22 +2431,39 @@ async function smartNavigate(direction: "forward" | "back") {
 
     // NOTE: the REVIEW branch is INTENTIONALLY flipped relative to the navigation branch (Ethan's preference,
     // 2026-06-20: "the diff one should be flipped, I know it's weird"). So the FORWARD button goes to the
-    // PREVIOUS change while reviewing, and the BACK button goes to the NEXT change. This flip now covers BOTH
-    // review views (diff + new-file) identically — Ethan confirmed 2026-07-04 the mouse direction "feels
-    // perfect", so we only fixed that new files ENGAGE change-nav; the direction semantics are unchanged.
+    // PREVIOUS change while reviewing, and the BACK button goes to the NEXT change. This flip now covers ALL
+    // review views (diff + new-file + deleted + merge + binary) identically — Ethan confirmed 2026-07-04 the
+    // mouse direction "feels perfect", so we only fix WHICH views engage change-nav; the direction is unchanged.
     // Outside a review view the buttons keep their normal meaning (forward = navigateForward, back = navigateBack).
     // The flip is a MOUSE-BUTTON preference only. It must never leak onto keyboard keys again: that's the
     // v1.2.5 QWERTY bug — these commands held the default alt+./alt+, (physical >/<) keyboard keys, so QWERTY
     // users got reversed >/< navigation while Dvorak (whose >/< keys type v/w -> next/previous-scm-change)
     // stayed correct. Keyboard >/< now binds the canonical scm-change commands directly in package.json.
+    //
+    // BUG 3 FIX (v1.2.9 — smart mouse corrupted lastNavDirection, making the "+" button advance the WRONG way):
+    // the review branch used to delegate via executeCommand("better-git-vscode.next-scm-change"/"previous-...").
+    // Those two COMMAND HANDLERS write the module-level lastNavDirection (next-scm-change sets "next",
+    // previous-scm-change sets "previous"). Because of the flip above, the smart-FORWARD button routed to
+    // previous-scm-change and set lastNavDirection="previous"; so after reviewing FORWARD with the mouse, the
+    // "+" button (which reads lastNavDirection) then advanced BACKWARD — the exact wrong-way bug the design
+    // comment at the top of this file (lines ~20-23) says the smart buttons must NEVER cause. Fix: call the
+    // underlying goToNextDiff()/goToPreviousDiff() DIRECTLY. They are the single-source-of-truth navigation
+    // functions; the command handlers are thin wrappers whose ONLY extra behaviour is the lastNavDirection
+    // write. Calling the functions gives byte-identical navigation while restoring the invariant that the
+    // flipped smart mouse buttons never touch lastNavDirection, so the "+" keeps advancing in Ethan's actual
+    // review direction. (F18/F19 were already immune — they pass an explicit direction.)
     if (direction === "forward") {
-        await vscode.commands.executeCommand(
-            inReview ? "better-git-vscode.previous-scm-change" : "workbench.action.navigateForward"
-        );
+        if (inReview) {
+            await goToPreviousDiff(); // flipped: forward button -> PREVIOUS change (does NOT write lastNavDirection)
+        } else {
+            await vscode.commands.executeCommand("workbench.action.navigateForward");
+        }
     } else {
-        await vscode.commands.executeCommand(
-            inReview ? "better-git-vscode.next-scm-change" : "workbench.action.navigateBack"
-        );
+        if (inReview) {
+            await goToNextDiff(); // flipped: back button -> NEXT change (does NOT write lastNavDirection)
+        } else {
+            await vscode.commands.executeCommand("workbench.action.navigateBack");
+        }
     }
 }
 

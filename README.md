@@ -99,6 +99,68 @@ clicking `+` then reaching for the keyboard. It calls the exact same logic as th
 fresh session with no navigation yet defaults to advancing *forward*. The plain, no-advance
 `Stage current file` command is still registered if you'd rather bind that to a key.
 
+## Mouse-driven review (recommended setup)
+
+You can drive the **entire** review-and-stage flow from your mouse — no keyboard at all. The trick
+is a two-hop mapping: **Karabiner-Elements** remaps your mouse's extra buttons to spare F-keys, and
+then VS Code's `keybindings.json` maps those F-keys to this extension's commands. This is the exact
+setup the author uses.
+
+**The four commands you bind:**
+
+| Mouse button | → F-key | → Command | What it does |
+| --- | --- | --- | --- |
+| **Back** (thumb rear) | `F13` | `better-git-vscode.smart-back` | In a review view: **next** change. Elsewhere: browser Back. |
+| **Forward** (thumb front) | `F17` | `better-git-vscode.smart-forward` | In a review view: **previous** change. Elsewhere: browser Forward. |
+| (extra button) | `F18` | `better-git-vscode.stage-and-next-changed-file` | Stage current file **+ next** change. |
+| (extra button) | `F19` | `better-git-vscode.stage-and-previous-changed-file` | Stage current file **+ previous** change. |
+
+**Why the "smart" commands are dual-mode.** `smart-back` / `smart-forward` detect whether you're in a
+diff/review view (a diff, a brand-new/untracked file, a deleted file, a merge-conflict editor, or a
+binary/image change). **In a review view they navigate changes; anywhere else they behave as ordinary
+editor Back/Forward** — so the same physical thumb buttons keep their normal browsing meaning when
+you're not reviewing, and become change-navigation the moment you're looking at a diff. (The in-diff
+direction is intentionally *flipped* for thumb buttons — Back goes to the **next** change, Forward to
+the **previous** — because that's what feels natural pressing them; see the note below.)
+
+**Everything behaves identically to the keyboard**, because the mouse buttons call the *exact same
+functions* the keyboard shortcuts do — no separate mouse code path. That means you get, for free:
+the end-of-list guards (roll over to the next/previous changed file at either end, and don't strand
+you on the last file), the few-lines-at-a-time scroll through brand-new files, and the tall-hunk
+staged stepping. The editor-title-bar **`+` button** also stages-and-advances in your last-navigated
+direction, so a click there is the mouse equivalent of `F18`/`F19`.
+
+### 1. Karabiner: map the mouse buttons to F-keys
+
+In **Karabiner-Elements → Devices** (or a `Complex Modification`), send `F13`, `F17`, `F18`, `F19`
+from your mouse's buttons. F13 and F16–F19 have no default macOS action, so they pass straight through
+to VS Code.
+
+> **Avoid `F14` / `F15`.** On macOS those are the **brightness down / up** keys — the OS swallows them
+> before VS Code ever sees them, so a binding on `F14` silently does nothing. Stick to `F13` and
+> `F16`–`F19`.
+
+### 2. VS Code: map the F-keys to the commands
+
+Add these to your `keybindings.json` (**Preferences: Open Keyboard Shortcuts (JSON)**). They're
+unconditional — the diff-vs-not decision is baked *into* the smart commands, so there's no `when`
+clause to get wrong:
+
+```jsonc
+[
+  // Mouse BACK button  (Karabiner sends F13) -> smart-back:    next change while reviewing, else browser Back
+  { "key": "f13", "command": "better-git-vscode.smart-back" },
+  // Mouse FORWARD button (Karabiner sends F17) -> smart-forward: previous change while reviewing, else Forward
+  { "key": "f17", "command": "better-git-vscode.smart-forward" },
+  // Extra mouse buttons (Karabiner sends F18 / F19) -> stage-and-advance in each direction
+  { "key": "f18", "command": "better-git-vscode.stage-and-next-changed-file" },
+  { "key": "f19", "command": "better-git-vscode.stage-and-previous-changed-file" }
+]
+```
+
+That's it — thumb-Back/Forward to fly through changes, the two extra buttons (or the title-bar `+`)
+to stage-and-advance, all without touching the keyboard.
+
 ## Dvorak mode (one toggle)
 
 The change-nav defaults live on the **physical `>` and `<` keys**. On QWERTY those keys
