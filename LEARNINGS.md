@@ -24,6 +24,16 @@ Each entry looks like:
 (newest first)
 
 ---
+**Date:** 2026-07-04T12:11:55Z
+**Trigger:** v1.2.2/1.2.3 publish task 2026-07-04
+**Symptom:** vsce publish fails TF400813 expired PAT even though OC published v1.2.1 the day before
+**Root cause:** OC's fresh PAT was stored only in the Mini's keytar 'vscode-vsce' entry (via npx vsce login) + bridged to MBP once but never persisted; MBP keychain + everyone's assumptions still pointed at the old dead token
+**Fix:** Recovered the raw 84-char PAT from the archived agent-bridge message (~/.agent-bridge/inbox/.archive/claude-code/default/2026-07-03T16-17-33*.json), verified with vsce verify-pat, stored durably as Keychain item 'vsce-pat-ethansk' acct EthanSK on BOTH machines; publish with VSCE_PAT="$(security find-generic-password -s vsce-pat-ethansk -a EthanSK -w)" npx @vscode/vsce publish
+**Commit:** 35ea5cb
+**Guard:** Keychain entry vsce-pat-ethansk on MBP+Mini + reference_vscode_marketplace_publish.md updated
+---
+
+---
 **Date:** 2026-07-04T11:58:23Z
 **Trigger:** Ethan request: 'make better-git-vscode minimize the worktrees if there are any when opening / reloading window'
 **Symptom:** Git worktrees / multiple repos render EXPANDED in the Source Control panel on every window open/reload; noisy with several worktrees
