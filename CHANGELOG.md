@@ -1,5 +1,21 @@
 # Change Log
 
+## [1.2.9] (ethansk fork) — edge-case audit: every entry point inherits every guard
+
+Broad correctness pass making the **mouse buttons, the `+` button, and the keyboard** behave identically across every file-state, by routing each broken entry point through the ONE shared function instead of a divergent per-case branch.
+
+- **Mouse smart Back/Forward now engage change-nav on merge-conflict and binary/image change views** (before: they fell through to browser back/forward on those while the keyboard navigated). This covers the 3-way merge editor *and* the default plain-editor conflict view (`git.mergeEditor=false`), plus binary/image changes shown as a custom editor — all recognised via the same shared predicates the keyboard uses.
+- **Fixed: the smart mouse buttons corrupted "last nav direction", making the `+` button advance the WRONG way.** They delegated via the `next/previous-scm-change` commands, which write `lastNavDirection`; combined with the intentional mouse flip, reviewing forward with the mouse then clicking `+` advanced *backward*. The mouse now calls the underlying nav functions directly, so it never writes `lastNavDirection` (as the design always intended) — `+` keeps advancing in your actual review direction.
+- **Stage-and-advance now works on merge-conflict files** (before: a silent no-op that stranded you on the conflict) and no longer skips conflicts as advance targets. Both the guard and the advance list are now derived from the same shared changes list the navigation uses (which includes merge conflicts).
+- **Fixed: stage-and-advance onto an untracked target did nothing** with `git.untrackedChanges="separate"` — it now routes through the shared open path that verifies the tab actually switched (same fallback plain navigation already had).
+- **Fixed: backward rollover into a new file skipped the whole file.** Reaching a genuinely-new file by pressing *previous* now lands at its bottom and steps up through it (mirroring how modified files land at their last hunk), instead of landing at the top and immediately jumping past it.
+- **Fixed: dual-state deleted/untracked files permanently dead-ended next/previous navigation.** A plain-editor change view is now correctly treated as the unstaged side, so the ambiguity guard no longer strands you with no recovery.
+- **Fixed: tall-hunk stepping used the wrong diff for partially-staged files** — it parsed the working-vs-HEAD diff while the editor shows working-vs-index, mis-detecting hunk extents. It now parses the same diff the editor displays.
+- **Fixed: tall hunks could advance before their last few changed lines were ever scrolled on screen** (the "tiny tail" was skipped). Stepping now shows every changed line before advancing. This also fixes a previous-direction "bounce" on hunks only slightly taller than the viewport.
+- **Fixed: a nav/reveal keypress could throw (do nothing) when the git extension wasn't ready or no repos had loaded** — it now no-ops gracefully like every other git-touching path.
+- **Fixed: a late worktree auto-collapse could yank you off the diff you were actively reviewing.** It now skips the re-reveal while a review is in flight.
+- **Fixed: rapid navigation while focus was in the Source Control panel could blank/lose your clipboard** — the clipboard-based path lookup is now avoided in the common path (resolved from the active tab instead) and serialized so concurrent presses can't interleave.
+
 ## [1.2.8] (ethansk fork) — mouse Forward/Back buttons now navigate **every** review view (new/untracked, deleted, …)
 
 - **Fixed: the smart mouse Forward/Back buttons (`smart-forward` / `smart-back`) only navigated inside modified-file diffs** — on newly-added / untracked ("U") files and deleted files they fell through to plain browser back/forward history and did nothing useful: no new-file 5-line scroll, no advance to the next change. The keyboard `Alt+,` / `Alt+.` worked on all of these, so mouse and keyboard behaved inconsistently.
