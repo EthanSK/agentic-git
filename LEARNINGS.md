@@ -24,6 +24,16 @@ Each entry looks like:
 (newest first)
 
 ---
+**Date:** 2026-07-04T19:57:11Z
+**Trigger:** Ethan voice note 2026-07-04: 'do it in stages... but obviously get the UX right for this... same with going to previous change... I'm currently having to get my fingers off the keyboard quite often.'
+**Symptom:** Tall hunks (taller than the viewport) forced Ethan off the keyboard: next-change landed at the hunk TOP, the rest ran off the bottom, so he had to manually scroll then press next again. Wanted next/prev-change to step through a tall hunk in stages.
+**Root cause:** VS Code's built-in compareEditor.next/previousChange only exposes hunk STARTS (moves the caret to each change), never a hunk's END, and TextEditor.diffInformation (the only public API to read a diff editor's change regions) is proposed API, unusable on engine ^1.83. So the extension had no way to know a hunk overflowed the screen.
+**Fix:** src/extension.ts: added a stateless/viewport-derived tall-hunk staging interposer in goToNextDiff/goToPreviousDiff. getModifiedSideHunks() parses the file's unified diff from the git API (repo.diffWithHEAD(path) unstaged / repo.diffIndexWithHEAD(path) staged) — reads @@ +newStart,newCount @@ headers, collects maximal runs of + lines as modified-side hunk ranges. Each press recomputes live from viewport (editor.visibleRanges) + caret + hunks: if caret is in a hunk taller than the viewport and its far edge is off-screen, scroll ~one viewport-minus-overlap and consume the press; else defer to the unchanged built-in nav. NO persisted state machine — the viewport+caret ARE the state, so reverse-direction / file-switch / caret-move resets are free. 4 settings: hunkStagingEnabled/Threshold(0=auto viewport)/LineStep(0=auto)/Overlap(4).
+**Commit:** pending
+**Guard:** Interposer only runs for TabInputTextDiff and only when it decides the caret is in a tall hunk whose far edge is off-screen; every other case returns false and the pre-existing navigation runs byte-for-byte (composes with new-file scroll, deleted files, cross-file rollover, smart mouse cmds, dvorak/qwerty gating). All defensive (try/catch, empty-diff->defer) so a parse failure degrades to plain hunk nav, never a dead keypress. Extensive design-rationale comments in-file. lint+tsc+package green.
+---
+
+---
 **Date:** 2026-07-04T16:24:01Z
 **Trigger:** Ethan voice/message 2026-07: '> and < next and prev are fukt on qwerty ... did u just patch the dvorak one?? ... the extra dvorak mode should be a thin wrapper on top of actual working behaviour, not redefining the functionality.'
 **Symptom:** better-git-vscode: next/previous SCM change (the headline > and < keys, alt+. / alt+,) were BROKEN on QWERTY — > navigated BACKWARD through diff changes, < navigated FORWARD, and outside a diff they did editor history navigation instead of change navigation. Dvorak layout was PERFECT (source of truth).

@@ -2,7 +2,7 @@
   "name": "better-git-vscode",
   "displayName": "Better Git VS Code",
   "description": "Fast keyboard-driven git diff review \u2014 jump between changes and changed files, stage-and-advance, revert, all without the mouse.",
-  "version": "1.2.5",
+  "version": "1.2.6",
   "icon": "src/icon.png",
   "engines": {
     "vscode": "^1.83.0"
@@ -159,6 +159,29 @@
           "default": 5,
           "minimum": 1,
           "description": "For a genuinely NEW file (untracked / staged-new / intent-to-add) shown as a plain editor, the next/previous-change shortcuts have no per-change hunks to jump between — so instead they step the cursor this many lines down/up, letting you scroll through and review the entire new file. When you reach the bottom (or top), they fall through to the next (or previous) changed file as usual. Never affects modified, deleted or renamed files, or any side-by-side diff — those always navigate change-to-change."
+        },
+        "better-git-vscode.hunkStagingEnabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Step through a TALL hunk (one taller than the visible editor) in stages using the same next/previous-change keys, instead of the rest running off the bottom of the screen. next-change lands at the top of a tall hunk; pressing next again scrolls DOWN by ~a screenful within that same hunk; repeat until the bottom is on screen, then the next press advances to the next hunk. previous-change mirrors it (step UP in stages, then advance to the previous hunk). Hunks that already fit on screen are unaffected — one press goes straight to the next/previous hunk exactly as before. Turn this off to always jump hunk-to-hunk."
+        },
+        "better-git-vscode.hunkStagingThreshold": {
+          "type": "number",
+          "default": 0,
+          "minimum": 0,
+          "description": "Minimum hunk height, in lines, before tall-hunk staging engages. 0 (default) = AUTO: use the real height of your visible editor (from the viewport), so staging kicks in exactly when a hunk can't fit on one screen — and adapts automatically to your window size. Set a positive number to override with a fixed line count (e.g. 40 = only stage hunks taller than 40 lines). Only applies when Tall-hunk staging is enabled."
+        },
+        "better-git-vscode.hunkStagingLineStep": {
+          "type": "number",
+          "default": 0,
+          "minimum": 0,
+          "description": "How many lines each within-hunk step scrolls while stepping through a tall hunk. 0 (default) = AUTO: one viewport height minus the overlap, so each press advances roughly a screenful while keeping a few lines of context. Set a positive number to override with a fixed step (e.g. 30). Only applies when Tall-hunk staging is enabled."
+        },
+        "better-git-vscode.hunkStagingOverlap": {
+          "type": "number",
+          "default": 4,
+          "minimum": 0,
+          "description": "How many lines of overlap to keep on screen between consecutive tall-hunk steps, so reading context carries across each step (a blind full-page jump loses your place). Default 4. Used by the AUTO step size (viewport minus this overlap) and to decide when the remaining tail of a hunk is too small to bother stepping (it just advances to the next hunk instead). Only applies when Tall-hunk staging is enabled."
         }
       }
     },
