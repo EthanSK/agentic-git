@@ -1385,6 +1385,322 @@ const stepThroughNewFile = async (editor: vscode.TextEditor, direction: "down" |
     return true;
 };
 
+// ──────────────────────────────────────────────────────────────────────────────────────────
+// TALL-HUNK STAGING (v1.2.6)
+//
+// WHY this exists (Ethan's exact problem): when reviewing with next/previous-change, a hunk that is
+// TALLER than the visible editor is a pain. One press of next-change lands you at the START (top) of the
+// hunk, but the rest of it runs off the bottom of the screen. To read the rest he has to take his hands
+// off the keyboard, scroll manually, then press next again. He wants to STEP THROUGH a tall hunk in
+// stages using the SAME next/previous-change keys: next lands at the top; pressing next AGAIN scrolls
+// DOWN by ~a screenful within that same hunk; repeat until the BOTTOM is on screen; the NEXT press then
+// advances to the next hunk. previous-change mirrors it (step UP in stages, then advance to the prev hunk).
+//
+// ── DESIGN CHOICE: STATELESS / VIEWPORT-DERIVED, NOT AN EXPLICIT STATE MACHINE ──
+// The spec framed this as a state machine ("track that you're mid-scrolling hunk X in direction D, reset
+// when you switch files / reverse / move the cursor"). We deliberately implement it WITHOUT a persisted
+// state object, because the viewport + cursor ARE the state and they're always live and exactly what
+// Ethan sees on screen. Every press RECOMPUTES from three live facts: (1) the current viewport
+// (editor.visibleRanges — real height, adapts to his window size), (2) the cursor line (our logical
+// "current change" anchor), and (3) the current file's hunk geometry (parsed fresh from git). This is the
+// same "recompute-live, tab-derived, focus-independent" philosophy the rest of this file already uses
+// (see visibleEditorForActiveTab / getActiveChange) and it makes ALL the required reset rules fall out
+// for free, with NO stale-state bugs to chase:
+//   • switch files / editors      -> a different tab means different hunks + a cursor at the new file; the
+//                                     old file's viewport is gone, so there's nothing stale to reset.
+//   • reverse direction mid-scroll -> "previous while scrolling down" just runs the UP branch against the
+//                                     live viewport: it sees the hunk top is still off-screen above and
+//                                     steps back UP one screenful. No teleport, because we never stored a
+//                                     "we were going down" flag to contradict.
+//   • cursor / selection moves elsewhere -> the cursor is no longer inside any tall hunk, so
+//                                     hunkContainingLine() returns undefined and we fall straight through
+//                                     to today's plain hunk-to-hunk navigation.
+//   • reached the end of the hunk  -> handled explicitly below (bottom/top already visible -> advance).
+//
+// ── CURSOR vs SCROLL ──
+// While stepping we move BOTH the viewport (revealRange) AND pin the cursor to the top visible line of the
+// new viewport. Keeping the caret inside the hunk (rather than leaving it at the file top) means: (a) other
+// commands stay sensible — revert-and-save (git.revertSelectedRanges) reverts the hunk the caret sits in,
+// which is exactly the hunk being read; and (b) when we DO advance, VS Code's built-in
+// compareEditor.next/previousChange navigates relative to the caret, so from inside the current (single,
+// contiguous) hunk it correctly lands on the following / preceding hunk.
+//
+// ── HOW WE KNOW A HUNK'S EXTENT ──
+// VS Code's built-in change navigation only exposes hunk STARTS (it moves the caret to each change), never
+// a hunk's END — and there's no stable public API on a diff editor to read its change regions on engine
+// ^1.83 (TextEditor.diffInformation is proposed API). So we compute the modified-side hunk ranges ourselves
+// by asking the git extension for the file's unified diff and parsing the `@@ ... +newStart,newCount @@`
+// headers (see getModifiedSideHunks). A "hunk" here = a maximal run of ADDED ('+') lines on the modified
+// side, which is exactly what the built-in navigation treats as one change stop — so our geometry lines up
+// with where next/previous-change actually land. Deleted-only regions produce no modified-side lines, are
+// never tall, and simply aren't in the list (the caret won't be "inside" one -> we defer to the built-in).
+//
+// ── COMPOSITION (must not break anything) ──
+// This layer is an INTERPOSER: it runs only for side-by-side text diffs (TabInputTextDiff) and only when it
+// decides the caret is inside a genuinely-tall hunk whose far edge isn't on screen yet. In every other case
+// it returns "not consumed" and the EXISTING navigation runs byte-for-byte as before — so the new-file
+// line-scroll (plain-editor added files), modified-file hunk nav, deleted files, cross-file rollover, the
+// smart mouse commands (which just executeCommand these same scm-change commands), and the dvorak/qwerty
+// key gating are all untouched. Everything is defensive (try/catch, empty-diff -> defer) so a parse failure
+// can never turn a keypress into a dead no-op — worst case it degrades to today's plain hunk navigation.
+
+// One contiguous changed region on the modified (new/right) side of a diff, as 0-based inclusive line
+// numbers matching the editor's modified-side document. Produced by getModifiedSideHunks.
+interface ModifiedHunk {
+    start: number; // first changed line (0-based)
+    end: number; // last changed line (0-based, inclusive)
+}
+
+// Reads the live config for the whole feature in one place so every helper agrees on the numbers. All the
+// "auto" defaults resolve against the passed-in visible line count so they adapt to Ethan's actual window
+// height (a blind fixed page-jump loses your place; viewport-relative feels right). Bad/absent values fall
+// back to sane defaults — never NaN/0 that could freeze stepping in place.
+const hunkStagingConfig = (visLines: number) => {
+    const cfg = vscode.workspace.getConfiguration("better-git-vscode");
+    const enabled = cfg.get<boolean>("hunkStagingEnabled", true);
+    // Overlap: lines kept on screen between consecutive steps so reading context carries across (default 4).
+    const rawOverlap = cfg.get<number>("hunkStagingOverlap", 4);
+    const overlap = Number.isFinite(rawOverlap) && (rawOverlap as number) >= 0 ? Math.floor(rawOverlap as number) : 4;
+    // Threshold: minimum hunk height (lines) to ENGAGE staging. 0 (default) = "auto" = the visible viewport
+    // height, so staging kicks in exactly when the hunk can't fit on one screen. A positive value overrides.
+    const rawThreshold = cfg.get<number>("hunkStagingThreshold", 0);
+    const threshold =
+        Number.isFinite(rawThreshold) && (rawThreshold as number) > 0 ? Math.floor(rawThreshold as number) : visLines;
+    // Step: lines to scroll per press. 0 (default) = "auto" = one viewport MINUS the overlap (so you advance
+    // ~a screenful but keep a few lines of context). A positive value overrides with a fixed line count.
+    const rawStep = cfg.get<number>("hunkStagingLineStep", 0);
+    const step =
+        Number.isFinite(rawStep) && (rawStep as number) > 0
+            ? Math.max(1, Math.floor(rawStep as number))
+            : Math.max(1, visLines - overlap);
+    return { enabled, overlap, threshold, step };
+};
+
+// Parse the modified-side (new/right) contiguous changed regions of the file currently being reviewed, so
+// we know each hunk's full vertical extent (start..end). We get the unified diff straight from the git
+// extension and read the `@@ -old +newStart,newCount @@` headers, then within each header's body count the
+// modified-side line number as we walk it: ' ' context and '+' added lines each occupy a modified line
+// (advance the counter); '-' removed lines exist only on the OLD side (don't advance, don't break a run —
+// in a replacement all '-' come before the '+' block, so the '+' lines stay contiguous). Each maximal run
+// of '+' lines becomes one ModifiedHunk. Line numbers therefore match the editor's modified document:
+//   • unstaged side  -> modified doc is the on-disk working file; diffWithHEAD's +lines are working lines.
+//   • staged  side   -> modified doc is the git: index blob; diffIndexWithHEAD's +lines are index lines.
+// (diffWithHEAD is working-tree-vs-HEAD; for a PARTIALLY-staged file that differs slightly from VS Code's
+// working-tree-vs-index "Changes" view, but the +line NUMBERS still address the same working document, so
+// tall-hunk detection stays correct. Fully-unstaged files — the common case — match exactly.) Any failure
+// (git API not ready, method missing, unreadable diff) returns [] so callers defer to plain navigation.
+const getModifiedSideHunks = async (fileUri: vscode.Uri, staged: boolean): Promise<ModifiedHunk[]> => {
+    try {
+        const git = vscode.extensions.getExtension<any>("vscode.git")?.exports?.getAPI(1);
+        const repo = git?.getRepository(fileUri);
+        if (!repo) {
+            return []; // no owning repo (or git not ready) -> defer to built-in navigation
+        }
+        // Ask git for THIS file's unified diff on the correct side. Both are overloads that take a path and
+        // return the raw unified-diff string (vscode.git Repository API).
+        const diffText: string = staged
+            ? await repo.diffIndexWithHEAD(fileUri.fsPath) // staged diff (index vs HEAD)
+            : await repo.diffWithHEAD(fileUri.fsPath); // unstaged diff (working tree vs HEAD)
+        if (!diffText) {
+            return [];
+        }
+        const hunks: ModifiedHunk[] = [];
+        const lines = diffText.split("\n");
+        // Matches a unified-diff hunk header and captures the modified-side (+) start line and count.
+        const headerRe = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/;
+        let modLine = 0; // 1-based modified-side line number as we walk the current hunk body
+        let inHunk = false;
+        let runStart = -1; // start of the current '+' run (1-based), or -1 when not in a run
+        let runEnd = -1; // last line of the current '+' run (1-based)
+        const closeRun = () => {
+            if (runStart !== -1) {
+                hunks.push({ start: runStart - 1, end: runEnd - 1 }); // convert to 0-based inclusive
+                runStart = -1;
+                runEnd = -1;
+            }
+        };
+        for (const line of lines) {
+            const header = headerRe.exec(line);
+            if (header) {
+                closeRun(); // a new header ends any run from the previous hunk
+                modLine = parseInt(header[1], 10); // +newStart
+                inHunk = true;
+                continue;
+            }
+            if (!inHunk) {
+                continue; // skip the file header lines (diff --git, index, ---, +++) before the first @@
+            }
+            const c = line[0];
+            if (c === "+") {
+                if (runStart === -1) {
+                    runStart = modLine; // begin a new run of added lines
+                }
+                runEnd = modLine;
+                modLine++;
+            } else if (c === " ") {
+                closeRun(); // context line ends a run and occupies a modified-side line
+                modLine++;
+            } else if (c === "-") {
+                // Removed line: exists only on the OLD side. Don't advance the modified counter, and don't
+                // break the run — the following '+' lines (if any) remain contiguous in modified numbering.
+            } else {
+                // "\ No newline at end of file" markers, blank trailing token from the final split, etc.
+                closeRun();
+            }
+        }
+        closeRun(); // flush the last run at end of diff
+        return hunks;
+    } catch {
+        return []; // git API shape changed / diff failed -> defer to plain navigation
+    }
+};
+
+// Find the hunk the caret is currently sitting in (our "logical current change"). Uses CONTAINMENT with a
+// tiny tolerance: the built-in change navigation can land the caret a line off from our parsed hunk start,
+// so we treat [start-tol, end+tol] as "inside". Returns undefined when the caret isn't inside any hunk
+// (e.g. resting in unchanged code between hunks) -> caller defers to plain hunk-to-hunk navigation.
+const hunkContainingLine = (hunks: ModifiedHunk[], line: number, tol = 1): ModifiedHunk | undefined => {
+    return hunks.find((h) => line >= h.start - tol && line <= h.end + tol);
+};
+
+// Bundle of everything the stepping logic needs for the file currently under review, or undefined when
+// tall-hunk staging doesn't apply (feature off, not a side-by-side diff tab, no resolvable editor/file, or
+// no parsed hunks). Computing this once per press means we parse the diff a single time and reuse it for
+// both the step decision and the on-landing reveal.
+interface HunkStageContext {
+    editor: vscode.TextEditor; // the visible editor rendering the modified side (the thing we scroll)
+    hunks: ModifiedHunk[]; // modified-side change regions for this file
+}
+
+const getHunkStageContext = async (): Promise<HunkStageContext | undefined> => {
+    // A quick viewport-independent gate read first (visLines only affects the numeric knobs, not enablement).
+    if (!vscode.workspace.getConfiguration("better-git-vscode").get<boolean>("hunkStagingEnabled", true)) {
+        return undefined;
+    }
+    // ONLY side-by-side text diffs have hunk geometry to step through. Plain-editor tabs (new files,
+    // deleted-file HEAD views) are handled by other code paths and must never reach here.
+    const tab = vscode.window.tabGroups.activeTabGroup.activeTab;
+    if (!(tab?.input instanceof vscode.TabInputTextDiff)) {
+        return undefined;
+    }
+    const editor = visibleEditorForActiveTab(); // the modified/right side's actual TextEditor (focus-independent)
+    if (!editor) {
+        return undefined;
+    }
+    const fileUri = currentReviewFileUri(); // on-disk file: uri (resolves a staged git: side back to the path)
+    if (!fileUri) {
+        return undefined;
+    }
+    // Which side is showing? getActiveChange reports staged===true when the modified side is the git: index
+    // blob. That selects diffIndexWithHEAD vs diffWithHEAD so the parsed line numbers match the shown doc.
+    const active = await getActiveChange();
+    const staged = active?.staged === true;
+    const hunks = await getModifiedSideHunks(fileUri, staged);
+    if (hunks.length === 0) {
+        return undefined; // nothing parseable -> defer to plain navigation
+    }
+    return { editor, hunks };
+};
+
+// Reads the current viewport of an editor as {top, bottom, visLines}. Uses the FIRST visible range's start
+// and the LAST visible range's end so folded regions in between don't confuse the height. Returns undefined
+// if the editor isn't laid out yet (no visible ranges) -> caller defers.
+const readViewport = (editor: vscode.TextEditor): { top: number; bottom: number; visLines: number } | undefined => {
+    const ranges = editor.visibleRanges;
+    if (!ranges || ranges.length === 0) {
+        return undefined;
+    }
+    const top = ranges[0].start.line;
+    const bottom = ranges[ranges.length - 1].end.line;
+    return { top, bottom, visLines: Math.max(1, bottom - top + 1) };
+};
+
+// Scroll `editor` so `topLine` is the top visible line, and pin the caret there (kept inside the hunk so
+// revert-and-save + the built-in advance both target the right change — see the CURSOR vs SCROLL note).
+const revealTopAndPinCursor = (editor: vscode.TextEditor, topLine: number): void => {
+    const clamped = Math.max(0, Math.min(topLine, Math.max(0, editor.document.lineCount - 1)));
+    const pos = new vscode.Position(clamped, 0);
+    editor.selection = new vscode.Selection(pos, pos); // caret follows the scroll, stays inside the hunk
+    editor.revealRange(new vscode.Range(clamped, 0, clamped, 0), vscode.TextEditorRevealType.AtTop);
+};
+
+// THE INTERPOSER. Given the per-press context and which key was pressed, decide whether this press should
+// be consumed as an IN-HUNK SCROLL STEP (return true) or fall through to plain hunk-to-hunk navigation
+// (return false). Fully live: reads the viewport + caret fresh, so reversing direction / moving the caret /
+// switching files all "just work" (see the big design note above).
+const stepTallHunk = async (ctx: HunkStageContext, direction: "down" | "up"): Promise<boolean> => {
+    const vp = readViewport(ctx.editor);
+    if (!vp) {
+        return false; // editor not laid out -> let built-in handle it
+    }
+    const { top, bottom, visLines } = vp;
+    const caret = ctx.editor.selection.active.line;
+    const hunk = hunkContainingLine(ctx.hunks, caret);
+    if (!hunk) {
+        return false; // caret isn't inside a hunk (between changes / moved away) -> plain navigation
+    }
+    const { threshold, step, overlap } = hunkStagingConfig(visLines);
+    const span = hunk.end - hunk.start + 1;
+    if (span <= threshold) {
+        return false; // hunk fits on one screen (or under the override threshold) -> behave EXACTLY as today
+    }
+    // If only a tiny tail of the hunk is beyond the current viewport edge, don't do a pointless 2-line final
+    // step — treat the far edge as "reached" and let the caller advance to the next/prev hunk instead.
+    const TINY_TAIL = Math.max(2, overlap);
+    if (direction === "down") {
+        const remainingBelow = hunk.end - bottom; // lines of the hunk still below the viewport
+        if (remainingBelow <= TINY_TAIL) {
+            return false; // bottom of the hunk is on screen (or all-but-a-sliver) -> advance to next hunk
+        }
+        // Scroll down ~one screenful (minus overlap), but never past the point where the hunk's last line
+        // sits at the bottom of the viewport (no scrolling into unchanged code below the hunk).
+        let newTop = Math.min(top + step, hunk.end - visLines + 1);
+        if (newTop <= top) {
+            newTop = top + step; // guarantee forward progress even in odd geometry
+        }
+        revealTopAndPinCursor(ctx.editor, newTop);
+        return true;
+    } else {
+        const remainingAbove = top - hunk.start; // lines of the hunk still above the viewport
+        if (remainingAbove <= TINY_TAIL) {
+            return false; // top of the hunk is on screen -> advance to previous hunk
+        }
+        let newTop = Math.max(top - step, hunk.start);
+        if (newTop >= top) {
+            newTop = top - step; // guarantee backward progress
+        }
+        revealTopAndPinCursor(ctx.editor, newTop);
+        return true;
+    }
+};
+
+// After the built-in navigation ADVANCES to a new hunk within the same file, reposition the viewport so a
+// tall hunk is presented for stage-stepping: going DOWN we land at its TOP (a full screenful from the
+// start, so the NEXT press steps down); going UP we land showing its BOTTOM portion (so the next press
+// steps UP toward the top). Short hunks are left exactly where the built-in put them (don't disturb today's
+// feel). Best-effort: no context / no matching hunk -> leave the built-in's own reveal untouched.
+const revealHunkOnLanding = (ctx: HunkStageContext, caretLine: number, direction: "down" | "up"): void => {
+    const vp = readViewport(ctx.editor);
+    if (!vp) {
+        return;
+    }
+    const { visLines } = vp;
+    const hunk = hunkContainingLine(ctx.hunks, caretLine);
+    if (!hunk) {
+        return;
+    }
+    const { threshold } = hunkStagingConfig(visLines);
+    if (hunk.end - hunk.start + 1 <= threshold) {
+        return; // short hunk -> the built-in's reveal is fine, don't reposition
+    }
+    if (direction === "down") {
+        revealTopAndPinCursor(ctx.editor, hunk.start); // land at the top of the tall hunk
+    } else {
+        // Land showing the bottom portion so subsequent 'previous' presses step UP through the hunk.
+        revealTopAndPinCursor(ctx.editor, Math.max(hunk.start, hunk.end - visLines + 1));
+    }
+};
+
 const goToNextDiff = async () => {
     var activeEditor = vscode.window.activeTextEditor;
     const currentFilename = await getActiveFilePath();
@@ -1409,6 +1725,16 @@ const goToNextDiff = async () => {
         return;
     }
 
+    // TALL-HUNK STAGING (v1.2.6): if the caret is inside a hunk taller than the viewport and its BOTTOM
+    // isn't on screen yet, consume this press as a downward scroll step (read the next screenful of the
+    // same hunk) instead of jumping to the next hunk. When it returns false (short hunk, bottom already
+    // visible, caret not in a hunk, or feature off) we fall through to the unchanged navigation below, so
+    // nothing else is disturbed. See the big design note above getModifiedSideHunks.
+    const stageCtx = await getHunkStageContext();
+    if (stageCtx && (await stepTallHunk(stageCtx, "down"))) {
+        return; // press was a within-hunk scroll step
+    }
+
     // Hunk navigation. Read the cursor from the TAB's own editor (falling back to the focused editor) so
     // the moved/didn't-move detection below works even when keyboard focus is in the SCM panel —
     // activeTextEditor alone could be a stale different-file editor there, which made the before/after
@@ -1425,6 +1751,13 @@ const goToNextDiff = async () => {
         // its modal confirmation path were removed entirely — see CHANGELOG v1.0.2.)
         await openNextFile();
         return;
+    }
+
+    // We advanced to a new hunk WITHIN this file. If it's a tall hunk, land at its TOP so the first
+    // screenful shows it from the start and the next press steps down through it (staging). Short hunks are
+    // left exactly where the built-in reveal put them. stageCtx.hunks is still valid (same file).
+    if (stageCtx && lineAfter !== undefined) {
+        revealHunkOnLanding(stageCtx, lineAfter, "down");
     }
 };
 
@@ -1448,6 +1781,15 @@ const goToPreviousDiff = async () => {
         return;
     }
 
+    // TALL-HUNK STAGING (v1.2.6), mirror of goToNextDiff: if the caret is inside a hunk taller than the
+    // viewport and its TOP isn't on screen yet, consume this press as an UPWARD scroll step (read the
+    // previous screenful of the same hunk) instead of jumping to the previous hunk. Returns false -> fall
+    // through to the unchanged navigation below.
+    const stageCtx = await getHunkStageContext();
+    if (stageCtx && (await stepTallHunk(stageCtx, "up"))) {
+        return; // press was a within-hunk upward scroll step
+    }
+
     // Hunk navigation — tab-derived editor for the before/after compare, same rationale as goToNextDiff.
     const navEditor = visibleEditorForActiveTab() ?? activeEditor;
     const lineBefore = navEditor?.selection.active.line;
@@ -1458,6 +1800,13 @@ const goToPreviousDiff = async () => {
         // Out of changes in the current file -> jump straight to the previous changed file, NO prompt.
         // Same rationale as goToNextDiff: the confirmation modal was removed entirely (see CHANGELOG v1.0.2).
         await openPreviousFile();
+        return;
+    }
+
+    // Advanced to a previous hunk within this file. If it's tall, land showing its BOTTOM portion so
+    // subsequent 'previous' presses step UP through it toward the top (the mirror of the next-change flow).
+    if (stageCtx && lineAfter !== undefined) {
+        revealHunkOnLanding(stageCtx, lineAfter, "up");
     }
 };
 

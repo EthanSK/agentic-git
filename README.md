@@ -35,6 +35,12 @@ When you open a *staged* file, what you see is a frozen, read-only snapshot of w
 
 Reviewing an AI changeset that adds whole new files? A brand-new file is one big new-diff with no per-change hunks to jump between, so change-navigation used to fly straight past it — you never actually read it. Now, on a fully-added file (untracked / staged-new), the next/previous-change keys **step the cursor a few lines at a time** so you page through and review the entire file, then roll on to the next change as usual. Tune the step with `better-git-vscode.newFileNavLineJump` (default 5). Modified files are never affected — they always navigate change-to-change.
 
+### Step through tall hunks in stages — no more reaching for the scrollbar
+
+Some hunks are **taller than your screen.** One press of next-change lands you at the *top* — and the rest runs off the bottom, so you'd have to take your hands off the keyboard, scroll, then press next again. Now the **same key steps through it in stages:** next-change lands at the top; press next **again** and it scrolls down about a screenful *within that same hunk*; keep going until the bottom is on screen, then the next press moves on to the next hunk. `previous-change` mirrors it — stepping **up** through a tall hunk, then on to the previous one once the top is visible. Reverse direction any time and it steps back the other way instead of teleporting.
+
+Hunks that already fit on screen are untouched — one press still jumps straight to the next/previous hunk. Staging kicks in **only when a hunk is taller than your visible editor** (measured live, so it adapts to your window size), and each step keeps a few lines of overlap so you never lose your place. Tune it with `better-git-vscode.hunkStagingThreshold`, `hunkStagingLineStep`, and `hunkStagingOverlap`, or turn it off with `hunkStagingEnabled`.
+
 ## Tidy worktrees: auto-collapse the extras, keep your main repo open
 
 If you work with **git worktrees** (or several repos in one window), VS Code's Source Control panel shows each as its own collapsible section and renders them **all expanded** on every window open / reload — noisy once you have a few. This extension folds them for you shortly after the window loads, so the panel stays tidy.
@@ -142,6 +148,7 @@ A few behaviours are configurable under **Settings → Better Git VS Code**:
 - **Last-staged status bar** — a bottom-left `✓ Staged: <filename>` indicator showing the last file you staged through the extension, so a fast stage-and-advance never stages something without you noticing. Click it to reopen that file's staged diff and unstage it if it was a mistake. Toggle with `better-git-vscode.showLastStagedInStatusBar` (default on).
 - **Auto-collapse extra worktrees** — fold the other worktree/repository sections on window open while keeping your main repo expanded (`better-git-vscode.collapseWorktreesOnStartup`, default on — see *Tidy worktrees* above).
 - **New-file line step** — how many lines the change keys step through a brand-new file (`better-git-vscode.newFileNavLineJump`, default 5).
+- **Tall-hunk staging** — step through a hunk taller than your screen in stages with the same next/previous keys, instead of the rest running off the bottom (`better-git-vscode.hunkStagingEnabled`, default on — see *Step through tall hunks in stages* above). Tune the engage threshold (`hunkStagingThreshold`, 0 = auto/viewport), the per-step scroll (`hunkStagingLineStep`, 0 = auto), and the overlap kept between steps (`hunkStagingOverlap`, default 4).
 - **List vs Tree view** in Source Control (`better-git-vscode.treeView`).
 - Whether the Source Control panel opens on navigation (`shouldOpenScmView`).
 - The badge shown on the file you're currently reviewing (`currentFileBadge`, default 🔥🔥).
