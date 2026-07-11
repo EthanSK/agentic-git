@@ -24,6 +24,16 @@ Each entry looks like:
 (newest first)
 
 ---
+**Date:** 2026-07-11T19:51:37Z
+**Trigger:** Ethan 2026-07-11: + button shifts position as up/down arrows spawn/despawn; pin it rightmost so mouse can hover one spot
+**Symptom:** The editor-title '+' (stage-current-file-and-advance) button SHIFTED horizontal position depending on file/diff/git state, so the user couldn't hover one fixed spot to click it.
+**Root cause:** The '+' was contributed to editor/title group 'navigation' with NO explicit @order. VS Code's built-in diff Previous/Next Change up/down arrows live in the SAME right-aligned navigation group (orders 10 & 11, confirmed against VS Code source) and spawn/despawn only in diff editors. With no order the '+' had no guaranteed rightmost anchor, so it slid left/right as the arrows toggled.
+**Fix:** package.json:125 editor/title item: 'group':'navigation' -> 'navigation@100'. Navigation group is right-aligned + sorts ascending by @order, so highest order = far right = anchored to the right edge; the built-in arrows (10/11) now always render to its LEFT and collapse without moving the '+'. when-clause (gitOpenRepositoryCount != 0) unchanged so the slot is always present; arrow spawn/despawn untouched — only their position RELATIVE to '+' is fixed.
+**Commit:** 55daa8e
+**Guard:** _comment_editorTitleOrder key in package.json explains the right-align/order mechanism in plain English. Codex xhigh verified built-in arrow orders are 10/11 (well below 100). Caveat: @100 is not absolute-rightmost-proof vs a future extension using navigation@>100, but no current conflict. lint+tsc+package green. Published v1.2.16 (PR #26).
+---
+
+---
 **Date:** 2026-07-10T17:24:03Z
 **Trigger:** Ethan 2026-07-10: went to previous change on a new untracked file at the top, clicked NEXT, expected +5 down but it went to the bottom
 **Symptom:** New untracked file that looked like it was at the TOP: pressing NEXT shot past the whole file to the bottom/next file instead of scrolling +5 down. Also: first few NEXT presses on a tall new file showed no visible scroll.
