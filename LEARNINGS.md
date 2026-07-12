@@ -24,6 +24,16 @@ Each entry looks like:
 (newest first)
 
 ---
+**Date:** 2026-07-12T21:52:33Z
+**Trigger:** Ethan 2026-07-11: if NO file has focus/selection (after we finish staging everything) next/previous-change should just PICK one, obviously
+**Symptom:** Pressing next/previous-change with NO file context (after stage-and-advance staged the LAST file and closed its editor, or focus on a clean/settings tab) silently did nothing
+**Root cause:** openNextFile/openPreviousFile bailed on findCurrentIndex===-1 for ANY miss — including 'active file is not a change at all' (the post-stage-everything focus state); openFirstFile/openLastFile silently returned on an empty change list; openFirstFile also opened a STAGED entry first (list order merge/staged/working) instead of actionable unstaged work; openLastFile never ran compareEditor.previousChange so backward entry landed at the FIRST hunk
+**Fix:** src/extension.ts v1.2.17: -1 now split into 'path matches NO entry' (-> openFirstFile/openLastFile pick: unstaged-first incl. merge+untracked, staged/index fallback once everything staged, quiet setStatusBarMessage 'No changes to navigate' when clean — never a popup) vs the dual-state AMBIGUITY GUARD (still bails, no guessing). openLastFile mirrors openPreviousFile (landNewFileTargetAtBottom else previousChange -> last hunk). smartNavigate starts review only when activeTabGroup.activeTab===undefined (tab-model gate, NOT activeNavFilePath — webviews like Settings have no file path and would be hijacked, and its clipboard fallback is the BUG 13 hot-path hazard). No-context picks never close the user's active editor
+**Commit:** 5fbbced
+**Guard:** Codex xhigh wrote + reviewed (caught/fixed the webview-hijack + clipboard-hot-path gate after reviewer flag); ambiguity-guard bail explicitly re-commented as a distinct -1 meaning; debugLog('nav', ...) records every pick/fallback/no-changes decision; lint+tsc+package green. Published v1.2.17 (PR #27)
+---
+
+---
 **Date:** 2026-07-11T19:51:37Z
 **Trigger:** Ethan 2026-07-11: + button shifts position as up/down arrows spawn/despawn; pin it rightmost so mouse can hover one spot
 **Symptom:** The editor-title '+' (stage-current-file-and-advance) button SHIFTED horizontal position depending on file/diff/git state, so the user couldn't hover one fixed spot to click it.
