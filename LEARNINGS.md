@@ -22,15 +22,24 @@ Each entry looks like:
 ## Release installation policy
 
 - Better Git code fixes requested by Ethan include completing the Marketplace release by default unless he explicitly says not to release that change.
-- Ethan's normal VS Code must end every release task on the **Marketplace-installed** copy of `EthanSK.better-git-vscode`, never a development VSIX.
-- Prefer the Extension Development Host for testing. Install a locally-packaged VSIX into Ethan's normal VS Code only when that exact integration check is genuinely required, and treat it as temporary.
-- After publishing, first prove the requested version is downloadable from the version-specific Marketplace gallery endpoint. Marketplace list/search metadata may lag or disagree briefly after a successful publish, so do not uninstall the working copy based only on `vsce show` ordering.
-- To replace a same-version VSIX reliably, uninstall `EthanSK.better-git-vscode`, then install `EthanSK.better-git-vscode@<version>` by Marketplace ID. `--force` on an already-installed identical version is not proof that VS Code replaced its source.
-- Verify both `code --list-extensions --show-versions` and the matching row in `~/.vscode/extensions/extensions.json`. The final row must have the released version and must not have `metadata.source: "vsix"`.
+- Release work must **not install, uninstall, update, reload, or restart** Better Git in Ethan's normal VS Code. Ethan will install Marketplace updates himself after they appear.
+- Test only in isolated Extension Development Hosts. A release is complete when Marketplace publication succeeds and the exact version-specific gallery package is downloadable and valid; the local installed version is not a release gate.
+- Do not run `code --install-extension`, `code --uninstall-extension`, or any equivalent normal-VS-Code mutation unless Ethan explicitly asks for that installation action in the current task. Permission to code, test, publish, or "release" does not imply permission to install.
+- Marketplace list/search metadata may lag briefly after a successful publish. Remote verification may wait or poll, but it must never touch Ethan's installed extension while waiting.
 
 ## Entries
 
 (newest first)
+
+---
+**Date:** 2026-07-14T20:49:54Z
+**Trigger:** Ethan 2026-07-14: "stop installing it, just release it and I will install it when it's updated; from now on remember that"
+**Symptom:** The release workflow treated upgrading Ethan's normal VS Code to the newly published Better Git version as mandatory closeout, including uninstall/install retries while Marketplace search metadata propagated.
+**Root cause:** The repository's release policy incorrectly equated successful Marketplace publication with permission to mutate Ethan's installed extension. Publishing and installing are separate actions with separate authorization.
+**Fix:** Release Better Git to the Marketplace by default, verify the version-specific remote package, and stop there. Never install, uninstall, update, reload, or restart Better Git in Ethan's normal VS Code unless he explicitly requests that installation action in the current task; Ethan handles routine Marketplace updates himself.
+**Commit:** pending on `codex/release-without-installing`
+**Guard:** Release closeout checks remote publication/package validity only. Any normal-VS-Code mutation during a release without an explicit current-task installation request violates this policy.
+---
 
 ---
 **Date:** 2026-07-14T19:35:41Z
