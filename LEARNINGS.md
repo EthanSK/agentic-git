@@ -32,6 +32,15 @@ Each entry looks like:
 (newest first)
 
 ---
+**Date:** 2026-07-14T16:39:12Z
+**Trigger:** Ethan 2026-07-14: on a new untracked file, Option+`>` moves once then cannot move forward; Option+`<` became glitchier; check the real Dvorak setup
+**Symptom:** Better Git appeared to have regressed the already-fixed untracked-file scroll bug: the keyboard shortcut could move once, then jump backward to the start or stop, while direct command invocation still stepped normally.
+**Root cause:** This was shortcut routing, not the viewport engine. Ethan's global `better-git-vscode.dvorakMode` is enabled with macOS `DVORAK - QWERTY CMD`. The manifest correctly mapped Dvorak `Alt+V`/`Alt+W` to canonical next/previous, but also mapped literal `Alt+.`/`Alt+,` to `smart-forward`/`smart-back`. Those smart commands are intentionally direction-flipped for mouse thumb buttons. In the live VS Code window, direct `Better Git: Next git change` moved and scrolled the 156-line untracked file from L5 to L10; live Option+`.` instead invoked the reversed route and moved L10 back to L1. The installed 1.2.23 artifact was byte-identical to the repo and gallery-sourced, so Claude had not modified or corrupted the installation.
+**Fix:** v1.2.24, commit 5891dfd: Dvorak mode retains `Alt+V`/`Alt+W` and adds `Alt+.`/`Alt+,` punctuation aliases to the same canonical next/previous commands, covering either character a host/input method reports for Option+the physical `>`/`<` keys. Stage-and-advance gets matching Shift aliases. `smart-forward`/`smart-back` now ship with no keyboard defaults; Ethan's independent F13/F17 user mouse bindings still reach them without letting their direction flip leak into keyboard review.
+**Guard:** Manifest E2E pins all eight Dvorak aliases to canonical commands and asserts smart-forward/back own no contributed keyboard binding. Real VS Code suite: 21/21, including repeated/rapid untracked-file viewport stepping and the new manifest pin; lint, TypeScript, production webpack, VSIX package, manifest inspection, and `git diff --check` passed. The initial downloader EPIPE was the already-known `@vscode/test-electron` progress-stream failure; rerunning with `BGV_VSCODE_EXECUTABLE_PATH=/Applications/Visual Studio Code.app/Contents/MacOS/Electron` passed.
+---
+
+---
 **Date:** 2026-07-14T13:25:40Z
 **Trigger:** Ethan 2026-07-14: do not leave Better Git installed locally; return normal VS Code to the Marketplace version after any necessary local test
 **Symptom:** After v1.2.23 was published, `code --list-extensions --show-versions` correctly showed `1.2.23`, but `~/.vscode/extensions/extensions.json` still identified the installed copy as `metadata.source: "vsix"`. Version alone could not distinguish the temporary local package from the Marketplace release.
