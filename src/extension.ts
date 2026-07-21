@@ -2151,9 +2151,9 @@ const hunkStagingConfig = (visLines: number) => {
             ? Math.floor(rawThreshold as number)
             : undefined;
     const threshold = thresholdOverride ?? visLines;
-    // Step: lines to scroll per press. The user-facing default is an exact five logical lines. Explicit 0 keeps
+    // Step: lines to scroll per press. The user-facing default is an exact ten logical lines. Explicit 0 keeps
     // the viewport-minus-overlap AUTO mode available; any positive custom value remains an exact fixed step.
-    const rawStep = cfg.get<number>("hunkStagingLineStep", 5);
+    const rawStep = cfg.get<number>("hunkStagingLineStep", 10);
     const step =
         Number.isFinite(rawStep) && (rawStep as number) > 0
             ? Math.max(1, Math.floor(rawStep as number))

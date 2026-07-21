@@ -32,6 +32,16 @@ Each entry looks like:
 (newest first)
 
 ---
+**Date:** 2026-07-21T22:30:00Z
+**Trigger:** Ethan after installing v1.2.35: “Actually think the default should be 10”
+**Symptom:** The configurable tall-hunk and large-replacement step worked correctly at five logical lines, but the default movement was smaller than Ethan wanted for normal review.
+**Root cause:** v1.2.35 deliberately introduced `5` as the manifest and runtime default while preserving arbitrary positive values and explicit `0` auto mode. This was a product-default choice, not a navigation defect.
+**Fix:** v1.2.37 changes only `hunkStagingLineStep`'s manifest default and runtime fallback to exactly `10`. The separate `newFileNavLineJump` default remains `5`, and the five-line ceiling for preserving a very nearby native inner stop remains a distinct safety heuristic. Positive custom values and explicit `0` auto mode are unchanged.
+**Commit:** pending (v1.2.37).
+**Guard:** Manifest coverage pins default `10` and minimum `0`; the tall-hunk real-host regression requires two default steps to move +20; the frozen AIMVS `profile-pic.service.ts` regression requires default +10 followed by custom +7 and mirrored -7 while staying in the file. Release closeout must record the exact Marketplace verifier result and installed gallery version.
+---
+
+---
 **Date:** 2026-07-21T22:21:28Z
 **Trigger:** Ethan 2026-07-21: “Open worktree in current window ... discarded the other open worktrees ... we need our own button ... adds the worktree to the workspace”; “Shift Command E ... should add it ... if I'm looking at it through the Source Control view”
 **Symptom:** A linked worktree visible in Source Control still could not be reached in Explorer. VS Code's worktree-header **Open Worktree in Current Window** replaced the current window's folder set, the header exposed no additive action, and Ethan's custom Shift+Cmd+E binding sometimes ran VS Code's built-in reveal instead of Better Git's existing auto-add reveal.

@@ -1,5 +1,10 @@
 # Change Log
 
+## [1.2.37] — ten lines by default
+
+- **Tall-hunk and large-replacement steps now move exactly ten logical lines by default.** `better-git-vscode.hunkStagingLineStep` remains fully configurable: any positive value is an exact custom step, while explicit `0` keeps viewport-minus-overlap auto mode.
+- **The runtime fallback, manifest, docs, and real-host regression agree on the new default.** The copied AIMVS `profile-pic.service.ts` case now requires default +10, then custom +7 and mirrored -7, without leaving the file or accepting VS Code's native L53→L149 skip.
+
 ## [1.2.36] — add worktrees without replacing the workspace
 
 - **Added `Add Worktree to Workspace` to linked-worktree header menus.** Unlike VS Code's built-in `Open Worktree in Current Window`, it appends the clicked worktree to Explorer and preserves every folder already in the current workspace.

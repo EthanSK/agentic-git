@@ -925,7 +925,7 @@ suite('SCM change navigation E2E', () => {
 		const rapidDownTops = await viewportTopsDuring(modifiedSide, () => Promise.all([nextChange(), nextChange()]));
 		const down = await expectViewportTop('committed/tall_e.txt', top => top > startTop, 'to advance through the tall hunk');
 		const downCaret = down.selection.active.line;
-		assert.strictEqual(downCaret, 20, `two default five-line tall-hunk steps must land at L21 (at L${downCaret + 1})`);
+		assert.strictEqual(downCaret, 30, `two default ten-line tall-hunk steps must land at L31 (at L${downCaret + 1})`);
 		assert.ok(lineIsVisible(down, downCaret), 'rapid tall-hunk next left its logical caret off-screen');
 		assertViewportMonotonic(rapidDownTops, 'down', 'rapid tall-hunk next');
 
@@ -1018,7 +1018,7 @@ suite('SCM change navigation E2E', () => {
 		}
 	});
 
-	test('copied profile-pic replacement: oversized built-in navigation steps the outer hunk by default 5 and custom 7', async () => {
+	test('copied profile-pic replacement: oversized built-in navigation steps the outer hunk by default 10 and custom 7', async () => {
 		const navConfig = vscode.workspace.getConfiguration('better-git-vscode');
 		const diffConfig = vscode.workspace.getConfiguration('diffEditor');
 		const previousStep = navConfig.inspect<number>('hunkStagingLineStep')?.globalValue;
@@ -1030,8 +1030,8 @@ suite('SCM change navigation E2E', () => {
 			await diffConfig.update('hideUnchangedRegions.enabled', false, vscode.ConfigurationTarget.Global);
 			assert.strictEqual(
 				navConfig.get<number>('hunkStagingLineStep'),
-				5,
-				'the real host must resolve the unset hunk step to the manifest default of five'
+				10,
+				'the real host must resolve the unset hunk step to the manifest default of ten'
 			);
 
 			const afterFixture = process.env.BGV_PROFILE_PIC_AFTER_FIXTURE_PATH;
@@ -1073,17 +1073,17 @@ suite('SCM change navigation E2E', () => {
 			await vscode.commands.executeCommand('workbench.view.scm');
 
 			const defaultStepTops = await viewportTopsDuring(editor, nextChange);
-			await expectCursorVisibleAt(rel, start + 5);
+			await expectCursorVisibleAt(rel, start + 10);
 			assertViewportMonotonic(defaultStepTops, 'down', 'copied profile-pic default outer-hunk step');
 			assert.strictEqual(activeTabPath(), wsUri(rel).path, 'default step prematurely changed files');
 
 			await navConfig.update('hunkStagingLineStep', 7, vscode.ConfigurationTarget.Global);
 			await nextChange();
-			await expectCursorVisibleAt(rel, start + 12);
+			await expectCursorVisibleAt(rel, start + 17);
 			assert.strictEqual(activeTabPath(), wsUri(rel).path, 'custom forward step prematurely changed files');
 
 			await previousChange();
-			await expectCursorVisibleAt(rel, start + 5);
+			await expectCursorVisibleAt(rel, start + 10);
 			assert.strictEqual(activeTabPath(), wsUri(rel).path, 'custom previous step must mirror the exact seven-line move');
 		} finally {
 			await navConfig.update('hunkStagingLineStep', previousStep, vscode.ConfigurationTarget.Global);
